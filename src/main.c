@@ -26,6 +26,7 @@
 #include "anomaly.h"
 #include "plots.h"
 #include "report.h"
+#include "export.h"
 
 static void usage(const char *prog)
 {
@@ -70,10 +71,14 @@ static void print_summary(const stats_t *s, const anomalies_t *a)
            s->n_flows, (unsigned long long)s->tcp_flows, (unsigned long long)s->udp_flows);
     printf("Retransmisje: %llu\n", (unsigned long long)s->tcp_retrans);
 
-    printf("\n=== Nieprawidłowości (%zu) ===\n", a->n);
-    for (size_t i = 0; i < a->n; i++)
-        printf("[%s] %s: %s\n", severity_name(a->items[i].severity),
-               a->items[i].category, a->items[i].text);
+    printf("\n=== Wynik ryzyka: %d/100 (%s) ===\n", a->risk_score,
+           risk_level_name(risk_level(a->risk_score)));
+    printf("\n=== Incydenty (%zu) ===\n", a->n);
+    for (size_t i = 0; i < a->n; i++) {
+        const anomaly_t *an = &a->items[i];
+        printf("[%s] %s  |  %s -> %s\n    %s\n", severity_name(an->severity),
+               an->category, an->source, an->target, an->text);
+    }
     if (a->n == 0)
         printf("Brak.\n");
 }
@@ -159,10 +164,11 @@ int main(int argc, char **argv)
     if (make_dir(outdir) != 0) {
         rc = 1;
     } else {
-        plot_list_t plots;
-        int errors = plots_generate(stats, &anomalies, outdir, &plots);
+        int n_png = 0;
+        int errors = plots_generate(stats, &anomalies, outdir, &n_png);
         if (errors)
             fprintf(stderr, "Uwaga: %d wykresów nie udało się wygenerować\n", errors);
+        int n_csv = export_csv(stats, &anomalies, outdir);
 
         char pdf_path[512];
         snprintf(pdf_path, sizeof pdf_path, "%s/raport.pdf", outdir);
@@ -173,13 +179,13 @@ int main(int argc, char **argv)
             .stats      = stats,
             .anomalies  = &anomalies,
             .thresholds = &th,
-            .plots      = &plots,
         };
         if (report_write(&rin) != 0)
             rc = 1;
 
         print_summary(stats, &anomalies);
-        printf("\nRaport: %s\nWykresy PNG: %d plików w katalogu %s/\n", pdf_path, plots.n, outdir);
+        printf("\nRaport:      %s\nWykresy PNG: %d plików, CSV: %d plików w katalogu %s/\n",
+               pdf_path, n_png, n_csv, outdir);
     }
 
     /* ---- 5. Sprzątanie ---- */

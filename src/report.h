@@ -17,7 +17,6 @@ typedef struct {
     const stats_t      *stats;
     const anomalies_t  *anomalies;
     const thresholds_t *thresholds;
-    const plot_list_t  *plots;
 } report_input_t;
 
 /* Tworzy plik PDF. Zwraca 0 przy sukcesie, -1 przy błędzie. */

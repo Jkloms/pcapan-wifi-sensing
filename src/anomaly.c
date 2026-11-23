@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <math.h>
 #include "anomaly.h"
 
@@ -33,6 +34,110 @@ const char *severity_name(severity_t s)
     }
 }
 
+int risk_level(int score)
+{
+    if (score >= 70) return 3;
+    if (score >= 40) return 2;
+    if (score >= 15) return 1;
+    return 0;
+}
+
+const char *risk_level_name(int level)
+{
+    static const char *names[] = { "NISKIE", "PODWYŻSZONE", "WYSOKIE", "KRYTYCZNE" };
+    return names[level < 0 ? 0 : level > 3 ? 3 : level];
+}
+
+/* ------------------------------------------------------------------ */
+/* Rekomendacje - stałe napisy (przechowywane w pamięci tylko do odczytu) */
+/* ------------------------------------------------------------------ */
+
+static const char *ADV_PORTSCAN =
+    "Zablokuj adres źródłowy na zaporze (firewall). Sprawdź, czy wykryte otwarte porty "
+    "są naprawdę potrzebne, i wyłącz zbędne usługi. Rozważ IDS/IPS (np. Suricata) "
+    "lub fail2ban, który blokuje skanery automatycznie.";
+static const char *ADV_UDPSCAN =
+    "Zablokuj adres źródłowy i ogranicz ruch UDP do hosta docelowego tylko do "
+    "potrzebnych portów. Jeśli natężenie jest duże, potraktuj to jak atak DoS "
+    "(zobacz UDP flood).";
+static const char *ADV_SWEEP =
+    "Zablokuj źródło. Jeśli to adres z Twojej sieci, sprawdź ten komputer pod kątem "
+    "złośliwego oprogramowania (robaki skanują sieć w poszukiwaniu ofiar). "
+    "Ogranicz dostęp do tego portu segmentacją sieci.";
+static const char *ADV_SYNFLOOD =
+    "Włącz SYN cookies na serwerze (sysctl net.ipv4.tcp_syncookies=1), ogranicz "
+    "liczbę nowych połączeń na sekundę (rate limiting) i rozważ ochronę anty-DDoS "
+    "u dostawcy. Blokowanie pojedynczych adresów nie pomoże, bo są fałszowane.";
+static const char *ADV_UDPFLOOD =
+    "Ogranicz ruch UDP do atakowanego hosta na brzegu sieci (rate limiting), "
+    "zablokuj nadawców i nieużywane porty UDP. Przy trwającym ataku skontaktuj się "
+    "z dostawcą Internetu.";
+static const char *ADV_RETRANS =
+    "Sprawdź obciążenie łącza i błędy na interfejsach (ip -s link), jakość Wi-Fi "
+    "i okablowania oraz ustawienia MTU. Wskazane połączenie to dobry punkt startowy.";
+static const char *ADV_RETRANS_OK = "Brak działań - poziom retransmisji jest w normie.";
+static const char *ADV_RST =
+    "Sprawdź, czy usługi docelowe działają i czy zapora nie odrzuca połączeń. "
+    "Jeśli RST są skutkiem skanowania, zobacz incydenty skanowania.";
+static const char *ADV_FLAGS =
+    "Zablokuj nadawcę. Zapora śledząca stan połączeń (stateful firewall) odrzuca "
+    "takie pakiety automatycznie - upewnij się, że jest włączona.";
+static const char *ADV_SPIKE =
+    "Sprawdź, co działo się we wskazanym czasie (filtr frame.time w Wiresharku). "
+    "Jeśli skoki się powtarzają, ustaw alarm na natężenie ruchu.";
+
+/* ------------------------------------------------------------------ */
+/* Dodawanie incydentu do listy                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Funkcja ze zmienną liczbą argumentów (jak printf). "..." oznacza dowolne
+ * dodatkowe argumenty; obsługuje się je makrami z <stdarg.h>.
+ * Zwraca wskaźnik na nowy incydent (żeby wywołujący uzupełnił resztę pól)
+ * albo NULL przy braku pamięci.
+ */
+static anomaly_t *add_anomaly(anomalies_t *out, severity_t sev, const char *cat,
+                              const char *advice, const char *fmt, ...)
+{
+    if (out->n == out->cap) {
+        size_t nc = out->cap ? out->cap * 2 : 16;
+        anomaly_t *tmp = realloc(out->items, nc * sizeof *tmp);
+        if (tmp == NULL)
+            return NULL;
+        out->items = tmp;
+        out->cap = nc;
+    }
+    anomaly_t *a = &out->items[out->n++];
+    memset(a, 0, sizeof *a);
+    a->severity = sev;
+    a->advice = advice;
+    snprintf(a->category, sizeof a->category, "%s", cat);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(a->text, sizeof a->text, fmt, ap);   /* bezpieczny printf do bufora */
+    va_end(ap);
+    return a;
+}
+
+/* Pomocnicze "settery" - uzupełniają pola incydentu. */
+static void set_src(anomaly_t *a, const ip_addr_t *ip)
+{
+    a->src_ip = *ip;
+    a->has_src_ip = 1;
+    addr_to_str(ip, a->source);
+}
+
+static void set_dst(anomaly_t *a, const ip_addr_t *ip, int port)
+{
+    char buf[ADDR_STR_LEN];
+    a->dst_ip = *ip;
+    a->has_dst_ip = 1;
+    addr_to_str(ip, buf);
+    if (port >= 0) snprintf(a->target, sizeof a->target, "%s:%d", buf, port);
+    else           snprintf(a->target, sizeof a->target, "%s", buf);
+}
+
 /* Rekord pomocniczy: "a próbowało połączyć się z b na porcie port". */
 typedef struct {
     ip_addr_t a, b;
@@ -40,38 +145,8 @@ typedef struct {
     uint8_t   proto;     /* PROTO_TCP / PROTO_UDP */
     uint8_t   failed;    /* 1 = brak udanego połączenia */
     uint8_t   open;      /* 1 = serwer odpowiedział (port otwarty) */
+    double    first, last;
 } attempt_t;
-
-/* ------------------------------------------------------------------ */
-/* Dodawanie anomalii do listy                                         */
-/* ------------------------------------------------------------------ */
-
-/*
- * Funkcja ze zmienną liczbą argumentów (jak printf). "..." oznacza dowolne
- * dodatkowe argumenty; obsługuje się je makrami z <stdarg.h>.
- */
-#include <stdarg.h>
-static int add_anomaly(anomalies_t *out, severity_t sev, const char *cat,
-                       const char *fmt, ...)
-{
-    if (out->n == out->cap) {
-        size_t nc = out->cap ? out->cap * 2 : 16;
-        anomaly_t *tmp = realloc(out->items, nc * sizeof *tmp);
-        if (tmp == NULL)
-            return -1;
-        out->items = tmp;
-        out->cap = nc;
-    }
-    anomaly_t *a = &out->items[out->n++];
-    a->severity = sev;
-    snprintf(a->category, sizeof a->category, "%s", cat);
-
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(a->text, sizeof a->text, fmt, ap);   /* bezpieczny printf do bufora */
-    va_end(ap);
-    return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /* Funkcje porównujące dla qsort                                       */
@@ -142,8 +217,10 @@ static int detect_scans(const stats_t *s, const thresholds_t *t, anomalies_t *ou
     if (s->n_flows == 0)
         return 0;
     attempt_t *att = malloc(s->n_flows * sizeof *att);
-    if (att == NULL)
-        return -1;
+    size_t fan_cap = 64, fan_n = 0;
+    fanout_t *fan = malloc(fan_cap * sizeof *fan);
+    if (att == NULL || fan == NULL)
+        goto oom;
 
     size_t n = 0;
     for (size_t i = 0; i < s->n_flows; i++) {
@@ -154,15 +231,13 @@ static int detect_scans(const stats_t *s, const thresholds_t *t, anomalies_t *ou
         att[n].proto = f->proto;
         att[n].failed = (uint8_t)flow_failed(f);
         att[n].open = (uint8_t)flow_open(f);
+        att[n].first = f->first_ts;
+        att[n].last = f->last_ts;
         n++;
     }
 
-    /* ---- Skanowanie portów: grupy (klient, serwer), liczymy różne porty ---- */
+    /* ---- Skanowanie portów: grupy (klient, serwer, protokół), liczymy różne porty ---- */
     qsort(att, n, sizeof *att, cmp_a_b_port);
-
-    size_t fan_cap = 64, fan_n = 0;
-    fanout_t *fan = malloc(fan_cap * sizeof *fan);
-    if (fan == NULL) { free(att); return -1; }
 
     size_t i = 0;
     while (i < n) {
@@ -173,15 +248,17 @@ static int detect_scans(const stats_t *s, const thresholds_t *t, anomalies_t *ou
             /* [j, k) - podgrupa: ten sam klient, serwer 'b' i protokół */
             size_t k = j;
             uint32_t ports = 0, failed = 0;
+            double first = att[j].first, last = att[j].last;
             char open_list[128] = "";
             int open_shown = 0;
             while (k < n && addr_cmp(&att[k].a, &att[j].a) == 0 &&
                    addr_cmp(&att[k].b, &att[j].b) == 0 && att[k].proto == att[j].proto) {
+                if (att[k].first < first) first = att[k].first;
+                if (att[k].last > last)   last = att[k].last;
                 /* nowy port tylko wtedy, gdy różni się od poprzedniego rekordu */
                 if (k == j || att[k].port != att[k - 1].port) {
                     ports++;
-                    int port_failed = att[k].failed;
-                    if (port_failed) failed++;
+                    if (att[k].failed) failed++;
                     if (att[k].open && open_shown < 8) {
                         size_t len = strlen(open_list);
                         snprintf(open_list + len, sizeof open_list - len, "%s%u",
@@ -195,24 +272,25 @@ static int detect_scans(const stats_t *s, const thresholds_t *t, anomalies_t *ou
             cli_failed += failed;
 
             if ((int)ports >= t->scan_min_ports && failed * 2 >= ports) {
-                char a[ADDR_STR_LEN], b[ADDR_STR_LEN];
-                addr_to_str(&att[j].a, a);
-                addr_to_str(&att[j].b, b);
                 severity_t sev = (ports >= 100) ? SEV_CRIT : SEV_WARN;
-                int rc;
+                anomaly_t *an;
                 if (att[j].proto == PROTO_TCP)
-                    rc = add_anomaly(out, sev, "Skanowanie portów TCP",
-                        "Host %s próbował połączyć się z %u różnymi portami TCP hosta %s "
-                        "(%u prób nieudanych). Odpowiedziały porty: %s.",
-                        a, ports, b, failed, open_shown ? open_list : "brak");
+                    an = add_anomaly(out, sev, "Skanowanie portów TCP", ADV_PORTSCAN,
+                        "Próby połączenia z %u różnymi portami TCP, z czego %u nieudanych. "
+                        "Odpowiedziały (są otwarte) porty: %s.",
+                        ports, failed, open_shown ? open_list : "brak");
                 else
-                    rc = add_anomaly(out, sev, "Skanowanie portów UDP",
-                        "Host %s wysłał pakiety UDP na %u różnych portów hosta %s, z czego "
-                        "%u bez żadnej odpowiedzi. To wzorzec skanowania UDP albo zalewu "
-                        "pakietami na losowe porty. Odpowiedziały porty: %s.",
-                        a, ports, b, failed, open_shown ? open_list : "brak");
-                if (rc != 0)
+                    an = add_anomaly(out, sev, "Skanowanie portów UDP", ADV_UDPSCAN,
+                        "Pakiety UDP wysłane na %u różnych portów, z czego %u bez żadnej "
+                        "odpowiedzi. To wzorzec skanowania UDP albo zalewu pakietami na "
+                        "losowe porty. Odpowiedziały porty: %s.",
+                        ports, failed, open_shown ? open_list : "brak");
+                if (an == NULL)
                     goto oom;
+                set_src(an, &att[j].a);
+                set_dst(an, &att[j].b, -1);
+                an->t_start = first;
+                an->t_end = last;
             }
             j = k;
         }
@@ -235,14 +313,17 @@ static int detect_scans(const stats_t *s, const thresholds_t *t, anomalies_t *ou
     out->n_fanout = fan_n;
     fan = NULL;          /* od teraz pamięcią zarządza 'out' (zwolni ją anomalies_free) */
 
-    /* ---- Skanowanie sieci: grupy (klient, port), liczymy różne serwery ---- */
+    /* ---- Skanowanie sieci: grupy (klient, protokół, port), liczymy różne serwery ---- */
     qsort(att, n, sizeof *att, cmp_a_port_b);
     i = 0;
     while (i < n) {
         size_t j = i;
         uint32_t hosts = 0, failed = 0;
+        double first = att[i].first, last = att[i].last;
         while (j < n && addr_cmp(&att[j].a, &att[i].a) == 0 && att[j].port == att[i].port &&
                att[j].proto == att[i].proto) {
+            if (att[j].first < first) first = att[j].first;
+            if (att[j].last > last)   last = att[j].last;
             if (j == i || addr_cmp(&att[j].b, &att[j - 1].b) != 0) {
                 hosts++;
                 if (att[j].failed) failed++;
@@ -250,13 +331,16 @@ static int detect_scans(const stats_t *s, const thresholds_t *t, anomalies_t *ou
             j++;
         }
         if ((int)hosts >= t->sweep_min_hosts && failed * 2 >= hosts) {
-            char a[ADDR_STR_LEN];
-            addr_to_str(&att[i].a, a);
-            if (add_anomaly(out, SEV_WARN, "Skanowanie sieci",
-                    "Host %s próbował połączyć się z portem %s/%u na %u różnych hostach "
-                    "(%u prób nieudanych).", a, att[i].proto == PROTO_TCP ? "TCP" : "UDP",
-                    att[i].port, hosts, failed) != 0)
+            anomaly_t *an = add_anomaly(out, SEV_WARN, "Skanowanie sieci", ADV_SWEEP,
+                    "Próby połączenia z portem %s/%u na %u różnych hostach, z czego %u "
+                    "nieudanych.", att[i].proto == PROTO_TCP ? "TCP" : "UDP",
+                    att[i].port, hosts, failed);
+            if (an == NULL)
                 goto oom;
+            set_src(an, &att[i].a);
+            snprintf(an->target, sizeof an->target, "%u hostów, port %u", hosts, att[i].port);
+            an->t_start = first;
+            an->t_end = last;
         }
         i = j;
     }
@@ -274,12 +358,24 @@ oom:   /* "goto" w C jest akceptowane do wspólnej obsługi błędów i sprząta
 /* Detektor 3: SYN flood                                               */
 /* ------------------------------------------------------------------ */
 
+static int cmp_double(const void *x, const void *y)
+{
+    double a = *(const double *)x, b = *(const double *)y;
+    return (a > b) - (a < b);
+}
+
 static int detect_synflood(const stats_t *s, const thresholds_t *t, anomalies_t *out)
 {
+    /* czasy nieudanych prób w bieżącej grupie - do wyznaczenia okna ataku */
+    double *times = malloc((s->n_flows ? s->n_flows : 1) * sizeof *times);
+    if (times == NULL)
+        return -1;
     /* Rekordy: a = serwer, port = port usługi, b = klient. */
     attempt_t *att = malloc((s->n_flows ? s->n_flows : 1) * sizeof *att);
-    if (att == NULL)
+    if (att == NULL) {
+        free(times);
         return -1;
+    }
     size_t n = 0;
     for (size_t i = 0; i < s->n_flows; i++) {
         const flow_t *f = s->flows[i];
@@ -291,6 +387,8 @@ static int detect_synflood(const stats_t *s, const thresholds_t *t, anomalies_t 
         att[n].proto = PROTO_TCP;
         att[n].failed = !(f->handshake & HS_ACK);
         att[n].open = 0;
+        att[n].first = f->first_ts;
+        att[n].last = f->last_ts;
         n++;
     }
     qsort(att, n, sizeof *att, cmp_a_port_b);
@@ -301,32 +399,43 @@ static int detect_synflood(const stats_t *s, const thresholds_t *t, anomalies_t 
         uint32_t total = 0, incomplete = 0, sources = 0;
         while (j < n && addr_cmp(&att[j].a, &att[i].a) == 0 && att[j].port == att[i].port) {
             total++;
-            if (att[j].failed) incomplete++;
+            if (att[j].failed)
+                times[incomplete++] = att[j].first;   /* czas nieudanej próby */
             if (j == i || addr_cmp(&att[j].b, &att[j - 1].b) != 0)
                 sources++;
             j++;
         }
         if ((int)incomplete >= t->synflood_min && incomplete * 2 >= total) {
-            char a[ADDR_STR_LEN];
-            addr_to_str(&att[i].a, a);
-            if (add_anomaly(out, SEV_CRIT, "SYN flood",
-                    "Usługa %s:%u otrzymała %u prób połączenia TCP, z czego %u nie "
-                    "zostało dokończonych (%.0f%%), z %u różnych adresów źródłowych. "
-                    "Wiele adresów źródłowych sugeruje ich fałszowanie (spoofing).",
-                    a, att[i].port, total, incomplete, 100.0 * incomplete / total,
-                    sources) != 0) {
+            /* Okno ataku: od 1. do 99. percentyla czasów - pojedyncze próby
+             * daleko od głównej fali (np. ze skanera) nie rozciągają okna. */
+            qsort(times, incomplete, sizeof *times, cmp_double);
+            double first = times[incomplete / 100];
+            double last = times[incomplete - 1 - incomplete / 100];
+            anomaly_t *an = add_anomaly(out, SEV_CRIT, "SYN flood", ADV_SYNFLOOD,
+                    "%u prób połączenia TCP, z czego %u nie zostało dokończonych (%.0f%%), "
+                    "z %u różnych adresów źródłowych. Tak wiele adresów sugeruje ich "
+                    "fałszowanie (spoofing).",
+                    total, incomplete, 100.0 * incomplete / total, sources);
+            if (an == NULL) {
                 free(att);
+                free(times);
                 return -1;
             }
+            set_dst(an, &att[i].a, att[i].port);
+            snprintf(an->source, sizeof an->source, "%u adresów%s", sources,
+                     sources > 50 ? " (fałszowane)" : "");
+            an->t_start = first;
+            an->t_end = last;
         }
         i = j;
     }
     free(att);
+    free(times);
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Detektor 4+5: retransmisje i RST                                     */
+/* Detektor 4+5: retransmisje, RST, nietypowe flagi                     */
 /* ------------------------------------------------------------------ */
 
 static int detect_tcp_health(const stats_t *s, const thresholds_t *t, anomalies_t *out)
@@ -341,22 +450,28 @@ static int detect_tcp_health(const stats_t *s, const thresholds_t *t, anomalies_
         for (size_t i = 0; i < s->n_flows; i++)
             if (worst == NULL || s->flows[i]->retrans > worst->retrans)
                 worst = s->flows[i];
-        char a[ADDR_STR_LEN], b[ADDR_STR_LEN];
+        char a[ADDR_STR_LEN];
         addr_to_str(&worst->cli, a);
-        addr_to_str(&worst->srv, b);
         severity_t sev = ratio >= 3 * t->retrans_ratio ? SEV_CRIT : SEV_WARN;
-        if (add_anomaly(out, sev, "Retransmisje TCP",
-                "%.1f%% pakietów TCP to retransmisje (%llu). Może to oznaczać utratę "
-                "pakietów, przeciążenie łącza lub problemy z siecią. Najwięcej "
-                "(%u) w połączeniu %s:%u -> %s:%u.",
+        anomaly_t *an = add_anomaly(out, sev, "Retransmisje TCP", ADV_RETRANS,
+                "%.1f%% pakietów TCP to retransmisje (%llu). Oznacza to utratę pakietów, "
+                "przeciążenie łącza lub problemy z siecią. Najwięcej retransmisji (%u) "
+                "było w połączeniu klienta %s:%u ze wskazanym celem.",
                 100.0 * ratio, (unsigned long long)s->tcp_retrans, worst->retrans,
-                a, worst->cport, b, worst->sport) != 0)
+                a, worst->cport);
+        if (an == NULL)
             return -1;
+        snprintf(an->source, sizeof an->source, "wiele połączeń");
+        set_dst(an, &worst->srv, worst->sport);
+        an->has_dst_ip = 0;            /* problem sieci, nie atak - nie na liście IOC */
     } else if (s->tcp_retrans > 0) {
-        if (add_anomaly(out, SEV_INFO, "Retransmisje TCP",
+        anomaly_t *an = add_anomaly(out, SEV_INFO, "Retransmisje TCP", ADV_RETRANS_OK,
                 "Wykryto %llu retransmisji (%.2f%% pakietów TCP) - poziom w normie.",
-                (unsigned long long)s->tcp_retrans, 100.0 * ratio) != 0)
+                (unsigned long long)s->tcp_retrans, 100.0 * ratio);
+        if (an == NULL)
             return -1;
+        snprintf(an->source, sizeof an->source, "-");
+        snprintf(an->target, sizeof an->target, "-");
     }
 
     /* Odsetek połączeń zerwanych przez RST */
@@ -369,25 +484,33 @@ static int detect_tcp_health(const stats_t *s, const thresholds_t *t, anomalies_
     if (s->tcp_flows > 0) {
         double r = (double)rst_flows / (double)s->tcp_flows;
         if (rst_flows >= 10 && r >= t->rst_ratio) {
-            if (add_anomaly(out, SEV_WARN, "Połączenia zrywane RST",
+            anomaly_t *an = add_anomaly(out, SEV_WARN, "Połączenia zrywane RST", ADV_RST,
                     "%.0f%% przepływów TCP (%llu z %llu) zawiera flagę RST. Typowe dla "
                     "skanowania portów, odrzucanych połączeń lub awarii usług.",
                     100.0 * r, (unsigned long long)rst_flows,
-                    (unsigned long long)s->tcp_flows) != 0)
+                    (unsigned long long)s->tcp_flows);
+            if (an == NULL)
                 return -1;
+            snprintf(an->source, sizeof an->source, "różne");
+            snprintf(an->target, sizeof an->target, "różne");
         }
     }
 
     /* Nietypowe kombinacje flag */
     uint64_t odd = s->f_null + s->f_xmas + s->f_synfin;
     if (odd > 0) {
-        if (add_anomaly(out, SEV_WARN, "Nietypowe flagi TCP",
-                "Wykryto pakiety z flagami niespotykanymi w normalnym ruchu: NULL (brak "
-                "flag): %llu, XMAS (FIN+PSH+URG): %llu, SYN+FIN: %llu. Takie pakiety "
-                "wysyłają skanery (np. nmap -sN/-sX) w celu rozpoznania systemu.",
+        anomaly_t *an = add_anomaly(out, SEV_WARN, "Nietypowe flagi TCP", ADV_FLAGS,
+                "Pakiety z flagami niespotykanymi w normalnym ruchu: NULL (brak flag): "
+                "%llu, XMAS (FIN+PSH+URG): %llu, SYN+FIN: %llu. Wysyłają je skanery "
+                "(np. nmap -sN/-sX), żeby rozpoznać system operacyjny i zaporę.",
                 (unsigned long long)s->f_null, (unsigned long long)s->f_xmas,
-                (unsigned long long)s->f_synfin) != 0)
+                (unsigned long long)s->f_synfin);
+        if (an == NULL)
             return -1;
+        set_src(an, &s->odd_src);
+        snprintf(an->target, sizeof an->target, "-");
+        an->t_start = s->odd_first_ts;
+        an->t_end = s->odd_last_ts;
     }
     return 0;
 }
@@ -433,13 +556,18 @@ static int detect_udpflood(const stats_t *s, const thresholds_t *t, anomalies_t 
     size_t i = 0;
     while (i < n) {
         size_t j = i;
-        uint64_t pkts = 0;
+        uint64_t pkts = 0, top_pkts = 0, cur_pkts = 0;
         uint32_t sources = 0;
+        size_t top_idx = i;
         double first = r[i].first, last = r[i].last;
         while (j < n && addr_cmp(&r[j].victim, &r[i].victim) == 0) {
             pkts += r[j].pkts;
-            if (j == i || addr_cmp(&r[j].attacker, &r[j - 1].attacker) != 0)
+            if (j == i || addr_cmp(&r[j].attacker, &r[j - 1].attacker) != 0) {
                 sources++;
+                cur_pkts = 0;
+            }
+            cur_pkts += r[j].pkts;
+            if (cur_pkts > top_pkts) { top_pkts = cur_pkts; top_idx = j; }
             if (r[j].first < first) first = r[j].first;
             if (r[j].last > last)   last = r[j].last;
             j++;
@@ -449,15 +577,26 @@ static int detect_udpflood(const stats_t *s, const thresholds_t *t, anomalies_t 
             span = 1.0;
         double pps = (double)pkts / span;
         if (pkts >= 1000 && pps >= t->udpflood_pps) {
-            char v[ADDR_STR_LEN];
-            addr_to_str(&r[i].victim, v);
-            if (add_anomaly(out, SEV_CRIT, "UDP flood",
-                    "Host %s otrzymał %llu pakietów UDP w %.1f s (średnio %.0f pakietów/s) "
-                    "od %u nadawców. Tak duże natężenie może oznaczać atak DoS.",
-                    v, (unsigned long long)pkts, span, pps, sources) != 0) {
+            anomaly_t *an = add_anomaly(out, SEV_CRIT, "UDP flood", ADV_UDPFLOOD,
+                    "%llu pakietów UDP w %.1f s (średnio %.0f pakietów/s) od %u nadawców. "
+                    "Tak duże natężenie może oznaczać atak DoS.",
+                    (unsigned long long)pkts, span, pps, sources);
+            if (an == NULL) {
                 free(r);
                 return -1;
             }
+            set_dst(an, &r[i].victim, -1);
+            if (sources == 1) {
+                set_src(an, &r[top_idx].attacker);
+            } else {
+                char a[ADDR_STR_LEN];
+                addr_to_str(&r[top_idx].attacker, a);
+                snprintf(an->source, sizeof an->source, "%u adresów (najwięcej %s)", sources, a);
+                an->src_ip = r[top_idx].attacker;
+                an->has_src_ip = 1;
+            }
+            an->t_start = first;
+            an->t_end = last;
         }
         i = j;
     }
@@ -486,22 +625,29 @@ static int detect_spikes(const stats_t *s, const thresholds_t *t, anomalies_t *o
     double sd = var > 0 ? sqrt(var) : 0;
     double limit = mean + t->spike_sigma * sd;
 
-    size_t count = 0, max_i = 0;
+    size_t count = 0, max_i = 0, first_i = 0, last_i = 0;
     double max_v = 0;
     for (size_t i = 0; i < s->tl_len; i++) {
         double v = s->timeline[i].pkts[0] + s->timeline[i].pkts[1];
         if (v > limit && v >= 2 * mean && v >= 100) {
+            if (count == 0) first_i = i;
+            last_i = i;
             count++;
             if (v > max_v) { max_v = v; max_i = i; }
         }
     }
     out->spike_count = count;
     if (count > 0) {
-        if (add_anomaly(out, SEV_WARN, "Skok natężenia ruchu",
-                "Liczba sekund, w których ruch przekroczył %.0f pakietów/s (średnia %.1f + "
-                "%.0f odchyleń standardowych): %zu. Największy skok: %.0f pakietów w %zu. "
-                "sekundzie nagrania.", limit, mean, t->spike_sigma, count, max_v, max_i) != 0)
+        anomaly_t *an = add_anomaly(out, SEV_WARN, "Skok natężenia ruchu", ADV_SPIKE,
+                "Liczba sekund z ruchem powyżej %.0f pakietów/s (średnia %.1f + %.0f "
+                "odchyleń standardowych): %zu. Największy skok: %.0f pakietów w %zu. "
+                "sekundzie nagrania.", limit, mean, t->spike_sigma, count, max_v, max_i);
+        if (an == NULL)
             return -1;
+        snprintf(an->source, sizeof an->source, "-");
+        snprintf(an->target, sizeof an->target, "-");
+        an->t_start = s->first_ts + (double)first_i;
+        an->t_end = s->first_ts + (double)last_i + 1.0;
     }
     return 0;
 }
@@ -511,7 +657,22 @@ static int detect_spikes(const stats_t *s, const thresholds_t *t, anomalies_t *o
 static int cmp_anomaly_sev(const void *x, const void *y)
 {
     const anomaly_t *p = x, *q = y;
-    return (int)q->severity - (int)p->severity;   /* najpierw najpoważniejsze */
+    if (p->severity != q->severity)
+        return (int)q->severity - (int)p->severity;   /* najpierw najpoważniejsze */
+    return (p->t_start > q->t_start) - (p->t_start < q->t_start);  /* potem wg czasu */
+}
+
+/*
+ * Wynik ryzyka 0-100: każdy incydent krytyczny dodaje 35 punktów,
+ * ostrzeżenie 15, informacja 0. Wynik jest obcinany do 100.
+ */
+static int compute_risk(const anomalies_t *a)
+{
+    int score = 0;
+    for (size_t i = 0; i < a->n; i++)
+        score += a->items[i].severity == SEV_CRIT ? 35 :
+                 a->items[i].severity == SEV_WARN ? 15 : 0;
+    return score > 100 ? 100 : score;
 }
 
 int anomalies_detect(const stats_t *s, const thresholds_t *t, anomalies_t *out)
@@ -524,7 +685,55 @@ int anomalies_detect(const stats_t *s, const thresholds_t *t, anomalies_t *out)
     if (detect_spikes(s, t, out) != 0)     return -1;
     if (out->n > 1)
         qsort(out->items, out->n, sizeof *out->items, cmp_anomaly_sev);
+    out->risk_score = compute_risk(out);
     return 0;
+}
+
+/* Szuka adresu na liście; jeśli go nie ma - dopisuje. Zwraca wskaźnik na wpis. */
+static ioc_t *ioc_find(ioc_t *list, long *n, const ip_addr_t *ip)
+{
+    for (long i = 0; i < *n; i++)
+        if (addr_cmp(&list[i].ip, ip) == 0)
+            return &list[i];
+    ioc_t *e = &list[(*n)++];
+    memset(e, 0, sizeof *e);
+    e->ip = *ip;
+    return e;
+}
+
+static int cmp_ioc(const void *x, const void *y)
+{
+    const ioc_t *p = x, *q = y;
+    if (p->max_sev != q->max_sev)       return (int)q->max_sev - (int)p->max_sev;
+    if ((p->attacker > 0) != (q->attacker > 0)) return (q->attacker > 0) - (p->attacker > 0);
+    return addr_cmp(&p->ip, &q->ip);
+}
+
+long anomalies_ioc(const anomalies_t *a, ioc_t **out)
+{
+    /* Każdy incydent daje najwyżej 2 adresy, więc 2*n miejsc wystarczy. */
+    ioc_t *list = malloc((2 * a->n + 1) * sizeof *list);
+    if (list == NULL)
+        return -1;
+    long n = 0;
+    for (size_t i = 0; i < a->n; i++) {
+        const anomaly_t *an = &a->items[i];
+        if (an->severity == SEV_INFO)
+            continue;
+        if (an->has_src_ip) {
+            ioc_t *e = ioc_find(list, &n, &an->src_ip);
+            e->attacker++;
+            if (an->severity > e->max_sev) e->max_sev = an->severity;
+        }
+        if (an->has_dst_ip) {
+            ioc_t *e = ioc_find(list, &n, &an->dst_ip);
+            e->victim++;
+            if (an->severity > e->max_sev) e->max_sev = an->severity;
+        }
+    }
+    qsort(list, (size_t)n, sizeof *list, cmp_ioc);
+    *out = list;
+    return n;
 }
 
 void anomalies_free(anomalies_t *a)

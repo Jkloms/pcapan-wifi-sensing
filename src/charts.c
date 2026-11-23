@@ -30,6 +30,8 @@ static rgb_t hex(unsigned v)
 #define COL_TEXT      0x0B0B0B   /* tekst główny */
 #define COL_TEXT2     0x52514E   /* tekst pomocniczy (osie, podpisy) */
 #define COL_GRID      0xE4E3DF   /* linie siatki */
+#define COL_CRIT      0xC62828   /* kolor statusu: krytyczne */
+#define COL_WARN      0xD97706   /* kolor statusu: ostrzeżenie */
 static const unsigned SERIES_COLORS[] = { 0x2A78D6, 0xEB6834, 0x1BAF7A, 0xEDA100 };
 
 static void set_color(cairo_t *cr, unsigned v)
@@ -88,28 +90,47 @@ static double nice_step(double max, int ticks)
     return nice * mag;
 }
 
-/* Tworzy powierzchnię i kontekst, wypełnia tło, rysuje tytuł i podtytuł. */
-static cairo_t *begin_chart(cairo_surface_t **surf, const char *title, const char *subtitle)
+/*
+ * Przygotowuje rysowanie: tło, tytuł, podtytuł.
+ * Jeśli 'target' == NULL, tworzy nowy obraz PNG w pamięci (*surf).
+ * W przeciwnym razie rysuje w podanym kontekście (np. strona PDF);
+ * cairo_save/cairo_restore chronią ustawienia wywołującego.
+ */
+static cairo_t *begin_chart(cairo_t *target, cairo_surface_t **surf,
+                            const char *title, const char *subtitle)
 {
-    *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, CHART_W, CHART_H);
-    cairo_t *cr = cairo_create(*surf);
+    cairo_t *cr;
+    if (target == NULL) {
+        *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, CHART_W, CHART_H);
+        cr = cairo_create(*surf);
+    } else {
+        *surf = NULL;
+        cr = target;
+        cairo_save(cr);
+        cairo_rectangle(cr, 0, 0, CHART_W, CHART_H);
+        cairo_clip(cr);                      /* nie wychodzimy poza obszar wykresu */
+    }
     set_color(cr, COL_SURFACE);
     cairo_paint(cr);                         /* wypełnia całe tło */
 
     set_color(cr, COL_TEXT);
-    set_font(cr, 22, 1);
-    draw_text(cr, 32, 44, title, AL_LEFT);
+    set_font(cr, 26, 1);
+    draw_text(cr, 32, 46, title, AL_LEFT);
     if (subtitle && *subtitle) {
         set_color(cr, COL_TEXT2);
-        set_font(cr, 14, 0);
-        draw_text(cr, 32, 68, subtitle, AL_LEFT);
+        set_font(cr, 16, 0);
+        draw_text(cr, 32, 72, subtitle, AL_LEFT);
     }
     return cr;
 }
 
-/* Zapisuje PNG i zwalnia zasoby cairo. */
+/* Kończy rysowanie: zapisuje PNG albo przywraca stan kontekstu PDF. */
 static int end_chart(cairo_surface_t *surf, cairo_t *cr, const char *path)
 {
+    if (surf == NULL) {                      /* tryb wektorowy (PDF) */
+        cairo_restore(cr);
+        return 0;
+    }
     cairo_destroy(cr);
     cairo_status_t st = cairo_surface_write_to_png(surf, path);
     cairo_surface_destroy(surf);
@@ -163,12 +184,12 @@ static int empty_chart(cairo_surface_t *surf, cairo_t *cr, const char *path)
 
 /* ------------------------------------------------------------------ */
 
-int chart_hbar(const char *path, const char *title, const char *subtitle,
+int chart_hbar(cairo_t *target, const char *path, const char *title, const char *subtitle,
                const char *const *labels, const double *values, size_t n,
                const char *unit)
 {
     cairo_surface_t *surf;
-    cairo_t *cr = begin_chart(&surf, title, subtitle);
+    cairo_t *cr = begin_chart(target, &surf, title, subtitle);
     if (n == 0)
         return empty_chart(surf, cr, path);
 
@@ -177,7 +198,7 @@ int chart_hbar(const char *path, const char *title, const char *subtitle,
         if (values[i] > max) max = values[i];
 
     /* Obszar rysowania: miejsce na etykiety po lewej i wartości po prawej. */
-    double left = 300, right = CHART_W - 110, top = 96, bottom = CHART_H - 30;
+    double left = 300, right = CHART_W - 150, top = 96, bottom = CHART_H - 30;
     double row = (bottom - top) / n;
     double bar_h = row * 0.62;
     if (bar_h > 34) bar_h = 34;
@@ -201,7 +222,7 @@ int chart_hbar(const char *path, const char *title, const char *subtitle,
         char lab[48];
         snprintf(lab, sizeof lab, "%s", labels[i]);
         set_color(cr, COL_TEXT);
-        set_font(cr, 14, 0);
+        set_font(cr, 16, 0);
         draw_text(cr, left - 12, cy + 5, lab, AL_RIGHT);
 
         /* wartość za słupkiem */
@@ -211,7 +232,7 @@ int chart_hbar(const char *path, const char *title, const char *subtitle,
         int space = unit && strlen(unit) > 2;
         snprintf(txt, sizeof txt, "%s%s%s", num, space ? " " : "", unit ? unit : "");
         set_color(cr, COL_TEXT2);
-        set_font(cr, 13, 0);
+        set_font(cr, 15, 0);
         draw_text(cr, left + w + 10, cy + 5, txt, AL_LEFT);
     }
     return end_chart(surf, cr, path);
@@ -228,7 +249,7 @@ static double draw_y_axis(cairo_t *cr, double max, double left, double right,
     if (axis_max <= 0)
         axis_max = 1;
 
-    set_font(cr, 12, 0);
+    set_font(cr, 14, 0);
     cairo_set_line_width(cr, 1);
     for (double v = 0; v <= axis_max + step / 2; v += step) {
         double y = bottom - (bottom - top) * v / axis_max;
@@ -250,19 +271,19 @@ static void draw_y_title(cairo_t *cr, const char *s, double top, double bottom)
     if (!s) return;
     cairo_save(cr);                          /* zapamiętaj stan (np. obrót) */
     set_color(cr, COL_TEXT2);
-    set_font(cr, 13, 0);
+    set_font(cr, 15, 0);
     cairo_translate(cr, 22, (top + bottom) / 2);
     cairo_rotate(cr, -M_PI / 2);
     draw_text(cr, 0, 0, s, AL_CENTER);
     cairo_restore(cr);                       /* przywróć stan */
 }
 
-int chart_vbar(const char *path, const char *title, const char *subtitle,
+int chart_vbar(cairo_t *target, const char *path, const char *title, const char *subtitle,
                const char *const *labels, const double *values, size_t n,
                const char *x_title, const char *y_title)
 {
     cairo_surface_t *surf;
-    cairo_t *cr = begin_chart(&surf, title, subtitle);
+    cairo_t *cr = begin_chart(target, &surf, title, subtitle);
     if (n == 0)
         return empty_chart(surf, cr, path);
 
@@ -289,16 +310,16 @@ int chart_vbar(const char *path, const char *title, const char *subtitle,
         char num[32];
         fmt_num(values[i], num, sizeof num);
         set_color(cr, COL_TEXT2);
-        set_font(cr, 12, 0);
+        set_font(cr, 14, 0);
         draw_text(cr, x + (slot - gap) / 2, bottom - h - 6, num, AL_CENTER);
 
         set_color(cr, COL_TEXT);
-        set_font(cr, 13, 0);
+        set_font(cr, 15, 0);
         draw_text(cr, x + (slot - gap) / 2, bottom + 20, labels[i], AL_CENTER);
     }
     if (x_title) {
         set_color(cr, COL_TEXT2);
-        set_font(cr, 13, 0);
+        set_font(cr, 15, 0);
         draw_text(cr, (left + right) / 2, CHART_H - 18, x_title, AL_CENTER);
     }
     return end_chart(surf, cr, path);
@@ -318,13 +339,13 @@ static void fmt_time(double sec, double total, char *out, size_t len)
         snprintf(out, len, "%ld:%02ldh", s / 3600, (s / 60) % 60);
 }
 
-int chart_lines(const char *path, const char *title, const char *subtitle,
+int chart_lines(cairo_t *target, const char *path, const char *title, const char *subtitle,
                 const double *const *series, const char *const *names,
                 size_t n_series, size_t n_points, double x_step,
-                const char *y_title)
+                const char *y_title, const chart_band_t *bands, size_t n_bands)
 {
     cairo_surface_t *surf;
-    cairo_t *cr = begin_chart(&surf, title, subtitle);
+    cairo_t *cr = begin_chart(target, &surf, title, subtitle);
     if (n_points == 0 || n_series == 0)
         return empty_chart(surf, cr, path);
 
@@ -340,7 +361,7 @@ int chart_lines(const char *path, const char *title, const char *subtitle,
     /* Oś X: czas od początku nagrania */
     double total = x_step * n_points;
     double tstep = nice_step(total, 8);
-    set_font(cr, 12, 0);
+    set_font(cr, 14, 0);
     set_color(cr, COL_TEXT2);
     for (double t = 0; t <= total + 1e-9; t += tstep) {
         double x = left + (right - left) * t / total;
@@ -352,7 +373,7 @@ int chart_lines(const char *path, const char *title, const char *subtitle,
 
     /* Legenda w jednym wierszu nad wykresem */
     double lx = left;
-    set_font(cr, 13, 0);
+    set_font(cr, 15, 0);
     for (size_t s = 0; s < n_series; s++) {
         set_color(cr, SERIES_COLORS[s % 4]);
         cairo_set_line_width(cr, 3);
@@ -364,6 +385,35 @@ int chart_lines(const char *path, const char *title, const char *subtitle,
         cairo_text_extents(cr, names[s], &ext);
         draw_text(cr, lx + 30, 95, names[s], AL_LEFT);
         lx += 30 + ext.x_advance + 28;
+    }
+
+    /* Zaznaczone przedziały (okna incydentów): półprzezroczyste pasy.
+     * Kolor ze stałą alfa (przezroczystością) - linie danych zostają widoczne. */
+    double last_label_x = -1000;
+    for (size_t b = 0; b < n_bands; b++) {
+        double x0 = left + (right - left) * bands[b].x0 / total;
+        double x1 = left + (right - left) * bands[b].x1 / total;
+        if (x1 - x0 < 4) { double c = (x0 + x1) / 2; x0 = c - 2; x1 = c + 2; }  /* min. 4 px */
+        if (x0 < left) x0 = left;
+        if (x1 > right) x1 = right;
+        rgb_t c = hex(bands[b].critical ? COL_CRIT : COL_WARN);
+        cairo_set_source_rgba(cr, c.r, c.g, c.b, 0.13);
+        cairo_rectangle(cr, x0, top - 6, x1 - x0, bottom - top + 6);
+        cairo_fill(cr);
+        cairo_set_source_rgba(cr, c.r, c.g, c.b, 0.9);
+        cairo_rectangle(cr, x0, top - 6, x1 - x0, 3);
+        cairo_fill(cr);
+        /* podpis tylko, gdy nie nachodzi na poprzedni (pasy mogą się pokrywać) */
+        if (bands[b].label && fabs(x0 - last_label_x) > 18) {
+            last_label_x = x0;
+            /* podpis pionowo wzdłuż lewej krawędzi pasa */
+            cairo_save(cr);
+            set_font(cr, 13, 1);
+            cairo_translate(cr, x0 + 4, top + 4);
+            cairo_rotate(cr, M_PI / 2);
+            draw_text(cr, 0, 0, bands[b].label, AL_LEFT);
+            cairo_restore(cr);
+        }
     }
 
     /* Linie serii: punkt i leży na środku swojego przedziału czasu */

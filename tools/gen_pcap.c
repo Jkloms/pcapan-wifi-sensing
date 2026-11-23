@@ -13,7 +13,8 @@
  *   retrans.pcap   - połączenia TCP na łączu gubiącym pakiety (retransmisje)
  *   mixed.pcap     - wszystko naraz (do przykładowego raportu)
  *
- * Użycie: ./tools/gen_pcap KATALOG
+ * Użycie: ./tools/gen_pcap KATALOG        (6 przykładowych plików)
+ *        ./tools/gen_pcap KATALOG big    (duży plik do testów wydajności)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +32,7 @@
 typedef struct {
     double   ts;
     uint32_t len;
-    uint8_t  data[MAX_PKT];
+    uint8_t *data;     /* bufor o dokładnym rozmiarze pakietu (oszczędność pamięci) */
 } rawpkt_t;
 
 typedef struct {
@@ -50,9 +51,30 @@ static rawpkt_t *cap_new(capture_t *c, double ts)
         }
     }
     rawpkt_t *p = &c->pkts[c->n++];
-    memset(p, 0, sizeof *p);
     p->ts = ts;
+    p->len = 0;
+    p->data = calloc(1, MAX_PKT);       /* na czas budowania - maksymalny rozmiar */
+    if (p->data == NULL) {
+        fprintf(stderr, "brak pamięci\n");
+        exit(1);
+    }
     return p;
+}
+
+/* Po zbudowaniu pakietu zmniejszamy bufor do faktycznej długości. */
+static void cap_done(rawpkt_t *p, uint32_t len)
+{
+    p->len = len;
+    uint8_t *tmp = realloc(p->data, len);
+    if (tmp != NULL)
+        p->data = tmp;
+}
+
+static void cap_free(capture_t *c)
+{
+    for (size_t i = 0; i < c->n; i++)
+        free(c->pkts[i].data);
+    free(c->pkts);
 }
 
 static int cmp_ts(const void *a, const void *b)
@@ -191,7 +213,7 @@ static void add_tcp(capture_t *c, double ts, uint32_t src, uint32_t dst,
     for (int i = 0; i < payload; i++)
         tcp[20 + i] = 'a' + (i % 26);
     wr16(tcp + 16, l4_checksum_v4(src, dst, 6, tcp, tcp_len));
-    p->len = 14 + 20 + tcp_len;
+    cap_done(p, 14 + 20 + tcp_len);
 }
 
 static void add_udp(capture_t *c, double ts, uint32_t src, uint32_t dst,
@@ -210,7 +232,7 @@ static void add_udp(capture_t *c, double ts, uint32_t src, uint32_t dst,
     for (int i = 0; i < payload; i++)
         udp[8 + i] = (uint8_t)rnd();
     wr16(udp + 6, l4_checksum_v4(src, dst, 17, udp, udp_len));
-    p->len = 14 + 20 + udp_len;
+    cap_done(p, 14 + 20 + udp_len);
 }
 
 /* Pakiet UDP w IPv6 (adresy fe80::X), żeby przetestować obsługę IPv6. */
@@ -230,7 +252,7 @@ static void add_udp6(capture_t *c, double ts, uint8_t src_last, uint8_t dst_last
     wr16(udp, sport);
     wr16(udp + 2, dport);
     wr16(udp + 4, udp_len);
-    p->len = 14 + 40 + udp_len;
+    cap_done(p, 14 + 40 + udp_len);
 }
 
 /* Ramka ARP - nie jest IP, więc analizator policzy ją jako "inne". */
@@ -242,7 +264,7 @@ static void add_arp(capture_t *c, double ts, uint32_t src, uint32_t target)
     wr16(a, 1); wr16(a + 2, 0x0800); a[4] = 6; a[5] = 4; wr16(a + 6, 1);
     wr32(a + 14, src);
     wr32(a + 24, target);
-    p->len = 14 + 28;
+    cap_done(p, 14 + 28);
 }
 
 /* ------------------------------------------------------------------ */
@@ -360,11 +382,11 @@ static void port_scan(capture_t *c, double t0)
     }
 }
 
-static void syn_flood(capture_t *c, double t0)
+static void syn_flood_n(capture_t *c, double t0, int count, double gap)
 {
     const uint32_t victim = IP(10, 0, 0, 5);
-    for (int i = 0; i < 4000; i++) {
-        double t = t0 + i * 0.001;
+    for (int i = 0; i < count; i++) {
+        double t = t0 + i * gap;
         uint32_t spoofed = IP(1 + rnd() % 222, rnd() % 256, rnd() % 256, 1 + rnd() % 254);
         uint32_t seq = rnd();
         uint16_t sp = 1024 + rnd() % 60000;
@@ -373,6 +395,8 @@ static void syn_flood(capture_t *c, double t0)
             add_tcp(c, t + 0.0003, victim, spoofed, 80, sp, rnd(), seq + 1, 0x12, 0, 65160);
     }
 }
+
+static void syn_flood(capture_t *c, double t0) { syn_flood_n(c, t0, 4000, 0.001); }
 
 static void udp_flood(capture_t *c, double t0)
 {
@@ -400,10 +424,28 @@ static void sc_mixed(capture_t *c)
     udp_flood(c, T0 + 85);
 }
 
+/* Duży plik do testów wydajności: ok. 2 mln pakietów i ponad 1 mln przepływów. */
+static void sc_big(capture_t *c)
+{
+    normal_traffic(c, T0, 300, 0.01);
+    syn_flood_n(c, T0 + 10, 1500000, 0.0002);
+    port_scan(c, T0 + 100);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 3 && strcmp(argv[2], "big") == 0) {
+        /* tryb: ./tools/gen_pcap KATALOG big */
+        capture_t c = { 0 };
+        char path[512];
+        snprintf(path, sizeof path, "%s/big.pcap", argv[1]);
+        sc_big(&c);
+        int rc = cap_write(&c, path);
+        cap_free(&c);
+        return rc ? 1 : 0;
+    }
     if (argc != 2) {
-        fprintf(stderr, "Użycie: %s KATALOG\n", argv[0]);
+        fprintf(stderr, "Użycie: %s KATALOG [big]\n", argv[0]);
         return 2;
     }
     const struct { const char *name; scenario_fn fn; } list[] = {
@@ -420,7 +462,7 @@ int main(int argc, char **argv)
         snprintf(path, sizeof path, "%s/%s", argv[1], list[i].name);
         if (cap_write(&c, path) != 0)
             return 1;
-        free(c.pkts);
+        cap_free(&c);
     }
     return 0;
 }

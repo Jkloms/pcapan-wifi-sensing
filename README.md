@@ -2,9 +2,24 @@
 
 `pcapan` to narzędzie w języku C dla systemu Linux. Wczytuje plik `.pcap` (albo `.pcapng`) i tworzy:
 
-* **raport PDF** z podsumowaniem, listą wykrytych nieprawidłowości, wykresami i tabelami,
-* **10 wykresów PNG** (ruch w czasie, przepustowość, protokoły, top hosty, top usługi, rozmiary pakietów, flagi TCP, stany połączeń, RTT, hosty kontaktujące najwięcej celów),
-* krótkie podsumowanie w terminalu.
+* **raport bezpieczeństwa PDF** ułożony jak raport z audytu: najpierw decyzja, potem szczegóły (opis niżej),
+* **10 wykresów PNG** (ruch w czasie z zaznaczonymi atakami, przepustowość, protokoły, top hosty, top usługi, rozmiary pakietów, flagi TCP, stany połączeń, RTT, hosty kontaktujące najwięcej celów),
+* **4 pliki CSV** do Excela / LibreOffice / SIEM: `incydenty.csv`, `ioc.csv`, `hosty.csv`, `przeplywy.csv`,
+* krótkie podsumowanie w terminalu (z wynikiem ryzyka).
+
+### Co wyróżnia raport PDF
+
+| Element | Po co |
+|---|---|
+| **Wynik ryzyka 0-100** na wskaźniku-łuku + werdykt słowny | decydent w 5 sekund wie, czy jest problem |
+| **Oś czasu z pasami incydentów** | widać, *kiedy* był atak i jak wyglądał ruch w tym czasie |
+| **Plan działania** | numerowane kroki "co zrobić", od najpilniejszego |
+| **Lista IOC** (adresy IP do zablokowania / sprawdzenia) | gotowe do wklejenia w zaporę; też w `ioc.csv` |
+| **Karty incydentów** | źródło, cel, okno czasowe, dowody liczbowe, rekomendacja |
+| **Klikalne odnośniki i zakładki PDF** | z podsumowania jednym kliknięciem do karty incydentu; spis treści w panelu bocznym |
+| **Wykresy wektorowe** (nie obrazki) | ostre przy każdym powiększeniu, PDF ~80 KB zamiast ~340 KB |
+| **"Jak czytać"** pod każdym wykresem + **słowniczek** | raport zrozumie też osoba nietechniczna |
+| **"Strona N z M"** | raport renderowany dwa razy: pierwszy przebieg liczy strony |
 
 Wykrywane nieprawidłowości: **skanowanie portów** (TCP i UDP), **skanowanie sieci**, **SYN flood**, **UDP flood**, **wysoki poziom retransmisji TCP**, **masowe zrywanie połączeń (RST)**, **nietypowe flagi TCP** (NULL / XMAS / SYN+FIN) oraz **nagłe skoki natężenia ruchu**.
 
@@ -51,6 +66,7 @@ Własny ruch możesz nagrać np. tak: `sudo tcpdump -i any -w moj.pcap`, a potem
 |---|---|
 | `make` | buduje `./pcapan` |
 | `make samples` | buduje `tools/gen_pcap` i tworzy 6 plików w `samples/` |
+| `./tools/gen_pcap /tmp big` | tworzy duży plik testowy (1,9 mln pakietów, 1,5 mln przepływów) |
 | `make example` | tworzy przykładowy raport w `examples/mixed/` |
 | `make debug` | buduje wersję z AddressSanitizerem (wykrywa błędy pamięci) |
 | `make clean` | usuwa pliki skompilowane |
@@ -72,13 +88,16 @@ Program to **potok** (pipeline): dane płyną w jedną stronę przez kolejne mod
                          └────┬─────┘                    │ anomalies_t
                               │                          │
                               ▼                          ▼
-                         ┌──────────┐  plik PNG    ┌───────────┐
+                         ┌──────────┐  plot_fn     ┌───────────┐
                          │  plots   │ ───────────► │  report   │ ──► raport.pdf
-                         │ (charts) │              │   (PDF)   │
+                         │ (charts) │ ──► *.png    │   (PDF)   │
                          └──────────┘              └───────────┘
+                         ┌──────────┐
+                         │  export  │ ──► incydenty.csv, ioc.csv, hosty.csv, przeplywy.csv
+                         └──────────┘
 ```
 
-`main.c` tylko łączy te kroki: otwiera plik, w pętli podaje pakiety z parsera do statystyk, potem uruchamia detektory, wykresy i raport.
+`main.c` tylko łączy te kroki: otwiera plik, w pętli podaje pakiety z parsera do statystyk, potem uruchamia detektory, wykresy, eksport CSV i raport.
 
 ### Pliki
 
@@ -94,7 +113,8 @@ pcapan/
 │   ├── anomaly.h/.c     detektory nieprawidłowości
 │   ├── charts.h/.c      generyczne wykresy PNG (cairo): słupkowe i liniowe
 │   ├── plots.h/.c       przygotowanie danych ze statystyk pod konkretne wykresy
-│   └── report.h/.c      składanie raportu PDF (cairo-pdf)
+│   ├── report.h/.c      składanie raportu PDF (cairo-pdf)
+│   └── export.h/.c      eksport CSV
 ├── tools/
 │   ├── gen_pcap.c       generator przykładowych plików .pcap
 │   └── lsan.supp        filtr znanych "wycieków" w bibliotece fontconfig (dla make debug)
@@ -162,19 +182,33 @@ Detektory działają **po** wczytaniu całego pliku. Główna sztuczka: z przep�
 | Nietypowe flagi | pakiety bez flag (NULL), FIN+PSH+URG (XMAS), SYN+FIN | > 0 |
 | Skok ruchu | sekunda z liczbą pakietów > średnia + 4σ (i ≥ 2× średnia, ≥ 100) | 4σ |
 
-Każda wykryta anomalia ma poziom (INFO / OSTRZEŻENIE / KRYTYCZNE) i opis po polsku.
+Każdy wykryty incydent (`anomaly_t`) ma: poziom (INFO / OSTRZEŻENIE / KRYTYCZNE), opis z liczbami (dowody), **źródło**, **cel**, **okno czasowe** (od-do) i **rekomendację**. Na końcu liczony jest **wynik ryzyka**: +35 za każdy incydent krytyczny, +15 za ostrzeżenie, maksymalnie 100 (0-14 niskie, 15-39 podwyższone, 40-69 wysokie, 70+ krytyczne). Funkcja `anomalies_ioc()` zbiera z incydentów listę adresów IP (IOC).
 
 ### 3.4. `charts` i `plots` – wykresy
 
-`charts.c` nic nie wie o sieciach. Rysuje generyczne wykresy (poziome i pionowe słupkowe, liniowe) z tablic etykiet i liczb, używając cairo. `plots.c` zamienia statystyki na te tablice (np. wybiera top 10 hostów funkcją `top_n`) i wywołuje odpowiedni wykres.
+`charts.c` nic nie wie o sieciach. Rysuje generyczne wykresy (poziome i pionowe słupkowe, liniowe z zaznaczonymi przedziałami czasu) z tablic etykiet i liczb, używając cairo. Każda funkcja rysuje **albo do PNG** (gdy dostanie `cr == NULL`), **albo w podanym kontekście cairo**, np. na stronie PDF. Ten sam kod daje więc obrazki PNG i wektorowe wykresy w raporcie.
+
+`plots.c` zamienia statystyki na tablice danych (np. wybiera top 10 hostów funkcją `top_n`) i wywołuje odpowiedni wykres. Wszystkie wykresy są w tablicy `PLOTS[]`: nazwa pliku, opis "jak czytać" i **wskaźnik na funkcję** rysującą. Raport przechodzi po tej tablicy i rysuje każdy wykres.
 
 ### 3.5. `report` – PDF
 
-Cairo rysuje do PDF tymi samymi funkcjami co do PNG. W `report.c` jest mały "silnik układu strony" (`pdf_t`). Pamięta bieżącą pozycję Y i sam zaczyna nową stronę, gdy brakuje miejsca (`ensure`). Na nim zbudowane są akapity z zawijaniem wierszy, nagłówki, tabele (z powtarzaniem nagłówka na nowej stronie) i wstawianie PNG.
+Cairo rysuje do PDF tymi samymi funkcjami co do PNG. W `report.c` jest mały "silnik układu strony" (`pdf_t`). Pamięta bieżącą pozycję Y i sam zaczyna nową stronę, gdy brakuje miejsca (`ensure`). Na nim zbudowane są akapity z zawijaniem wierszy (`paragraph_box` umie też tylko *zmierzyć* wysokość, żeby karta incydentu nie została przecięta między stronami), nagłówki, tabele i wykresy wektorowe.
 
-Sekcje raportu: kafelki z głównymi liczbami, (1) podsumowanie, (2) nieprawidłowości, (3) wykresy, (4) tabele: hosty, usługi, największe przepływy, (5) metodologia i progi.
+Kolejność stron:
+1. **Podsumowanie**: wynik ryzyka, werdykt, 6 kafelków z liczbami, oś czasu z incydentami, lista najważniejszych incydentów (klikalna).
+2. **Plan działania** i **lista IOC**.
+3. **Karty incydentów**.
+4. **Charakterystyka ruchu**: wykresy z opisem "jak czytać".
+5. **Szczegóły**: statystyki ogólne, hosty, usługi, największe przepływy.
+6. **Metodologia i słowniczek**.
 
-### 3.6. `tools/gen_pcap` – dane testowe
+Raport jest renderowany **dwa razy**. Pierwszy przebieg zapisuje "do nikąd" (`cairo_pdf_surface_create_for_stream` z funkcją, która wyrzuca dane) i tylko liczy strony. Drugi zapisuje plik, a stopka zna już łączną liczbę stron. Zakładki to `cairo_pdf_surface_add_outline`, a odnośniki to `cairo_tag_begin(CAIRO_TAG_LINK / CAIRO_TAG_DEST)`.
+
+### 3.6. `export` – CSV
+
+Separator to średnik (tak domyślnie czyta polski Excel), kodowanie UTF-8. Pola tekstowe są w cudzysłowach, a cudzysłów w tekście jest podwajany. Przy milionach wierszy pomaga duży bufor zapisu (`setvbuf`).
+
+### 3.7. `tools/gen_pcap` – dane testowe
 
 Generator buduje pakiety bajt po bajcie (z poprawnymi sumami kontrolnymi IP/TCP/UDP) i zapisuje je przez `pcap_dump`. Wynik otworzy też Wireshark. Ziarno losowania jest stałe, więc pliki są zawsze takie same.
 
@@ -223,9 +257,29 @@ Generator buduje pakiety bajt po bajcie (z poprawnymi sumami kontrolnymi IP/TCP/
 
 ---
 
-## 5. Ograniczenia i pomysły na rozwój
+## 5. Wydajność i optymalizacje
+
+Test na pliku `big.pcap` (1,9 mln pakietów, 157 MB, 1,5 mln przepływów i adresów IP, SYN flood z fałszywych adresów):
+
+| Wersja | Czas | Co zmieniono |
+|---|---|---|
+| pierwsza | **68 s** | tablice haszujące o stałym rozmiarze (4096 kubełków dla hostów) |
+| obecna | **5 s** analiza (7 s razem z eksportem 165 MB CSV) | tablice haszujące rosną (podwajanie + rehash), zapamiętany hash w elemencie |
+
+Co dokładnie zoptymalizowano:
+1. **Rosnące tablice haszujące** (`stats.c`: `host_hash_grow`, `flow_hash_grow`). Przy stałej liczbie kubełków i milionie hostów każda lista miała setki elementów, więc każde wyszukiwanie przechodziło po setkach adresów. Teraz, gdy elementów jest więcej niż kubełków, tablica się podwaja, a średnia lista ma najwyżej 1 element.
+2. **Zapamiętany hash** w każdym elemencie. Najpierw porównujemy liczby (tanio), dopiero potem adresy. Przy powiększaniu tablicy hashe nie są liczone od nowa.
+3. **`top_n` zamiast sortowania**. Do tabeli 20 największych przepływów nie sortujemy 1,5 mln elementów, tylko jednym przejściem wybieramy 20 największych.
+4. **Stan przepływu jako `enum`** zamiast porównywania napisów (`strcmp`) przy liczeniu wykresu stanów.
+5. **Generator**: pakiet trzyma bufor o dokładnym rozmiarze (`realloc`), a nie stałe 1600 B. Duży plik testowy mieści się w pamięci.
+6. **PDF**: wykresy wektorowe zamiast osadzonych PNG, więc plik jest ok. 4× mniejszy.
+
+Pomiar: `/usr/bin/time -v ./pcapan -o /tmp/x /tmp/big.pcap` (pole "Elapsed" i "Maximum resident set size"). Profil: zbuduj z `-pg` i uruchom `gprof ./pcapan gmon.out`.
+
+## 6. Ograniczenia i pomysły na rozwój
 
 * Nagłówki rozszerzeń IPv6 i fragmentacja IP są pomijane (fragmenty poza pierwszym nie są analizowane).
 * Pakiety przestawione w kolejności są liczone jako retransmisje (uproszczenie).
 * Oś czasu ma rozdzielczość 1 s i jest ograniczona do 7 dni nagrania.
-* Pomysły: analiza zapytań DNS (najczęstsze domeny), wykrywanie beaconingu (regularne połączenia), eksport CSV/JSON, porównanie dwóch plików.
+* Pamięć: ok. 350 B na przepływ (1,5 mln przepływów to ok. 560 MB). Dalsza optymalizacja to alokator "pulowy" (jeden duży blok zamiast osobnego `calloc` dla każdego przepływu).
+* Pomysły: analiza zapytań DNS (najczęstsze domeny), wykrywanie beaconingu (regularne połączenia), eksport JSON, porównanie dwóch plików.

@@ -1,0 +1,5 @@
+ip;rola;incydenty_jako_zrodlo;incydenty_jako_cel;najwyzsza_waga
+10.0.0.66;źródło ataku;2;0;KRYTYCZNE
+203.0.113.99;źródło ataku;2;0;KRYTYCZNE
+10.0.0.5;cel ataku;0;2;KRYTYCZNE
+10.0.0.20;cel ataku;0;2;KRYTYCZNE

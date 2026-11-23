@@ -90,8 +90,10 @@ stats_t *stats_create(void)
         return NULL;
     s->tcp_port_pkts = calloc(65536, sizeof(uint64_t));
     s->udp_port_pkts = calloc(65536, sizeof(uint64_t));
-    s->flow_hash     = calloc(FLOW_HASH_SIZE, sizeof(flow_t *));
-    s->host_hash     = calloc(HOST_HASH_SIZE, sizeof(host_t *));
+    s->flow_hash_size = FLOW_HASH_INIT;
+    s->host_hash_size = HOST_HASH_INIT;
+    s->flow_hash     = calloc(s->flow_hash_size, sizeof(flow_t *));
+    s->host_hash     = calloc(s->host_hash_size, sizeof(host_t *));
     if (!s->tcp_port_pkts || !s->udp_port_pkts || !s->flow_hash || !s->host_hash) {
         stats_free(s);
         return NULL;
@@ -184,24 +186,72 @@ static int timeline_add(stats_t *s, const packet_t *p, int proto_idx)
 /* Hosty                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * OPTYMALIZACJA: tablica haszująca, która rośnie.
+ * Przy stałej liczbie kubełków (np. 4096) i milionie hostów każda lista
+ * miałaby setki elementów, a wyszukiwanie byłoby bardzo wolne. Dlatego gdy
+ * elementów jest więcej niż kubełków, podwajamy tablicę i rozkładamy
+ * elementy na nowo ("rehash"). Średnia długość listy zostaje <= 1.
+ * Każdy element pamięta swój hash, więc nie trzeba go liczyć ponownie.
+ */
+static int host_hash_grow(stats_t *s)
+{
+    size_t new_size = s->host_hash_size * 2;
+    host_t **nb = calloc(new_size, sizeof *nb);
+    if (nb == NULL)
+        return -1;
+    for (size_t i = 0; i < s->n_hosts; i++) {
+        host_t *h = s->hosts[i];
+        size_t b = h->hash & (new_size - 1);
+        h->hnext = nb[b];
+        nb[b] = h;
+    }
+    free(s->host_hash);
+    s->host_hash = nb;
+    s->host_hash_size = new_size;
+    return 0;
+}
+
+static int flow_hash_grow(stats_t *s)
+{
+    size_t new_size = s->flow_hash_size * 2;
+    flow_t **nb = calloc(new_size, sizeof *nb);
+    if (nb == NULL)
+        return -1;
+    for (size_t i = 0; i < s->n_flows; i++) {
+        flow_t *f = s->flows[i];
+        size_t b = f->hash & (new_size - 1);
+        f->hnext = nb[b];
+        nb[b] = f;
+    }
+    free(s->flow_hash);
+    s->flow_hash = nb;
+    s->flow_hash_size = new_size;
+    return 0;
+}
+
 /* Znajduje hosta o danym adresie albo tworzy nowego. */
 static host_t *host_get(stats_t *s, const ip_addr_t *a)
 {
-    uint32_t bucket = hash_addr(a) & (HOST_HASH_SIZE - 1);
+    uint32_t hash = hash_addr(a);
+    size_t bucket = hash & (s->host_hash_size - 1);
     for (host_t *h = s->host_hash[bucket]; h != NULL; h = h->hnext)
-        if (addr_cmp(&h->addr, a) == 0)
+        if (h->hash == hash && addr_cmp(&h->addr, a) == 0)   /* najpierw tanie porównanie liczb */
             return h;
 
     host_t *h = calloc(1, sizeof *h);
     if (h == NULL)
         return NULL;
     h->addr = *a;                               /* kopiowanie całej struktury */
+    h->hash = hash;
     if (push_ptr((void ***)&s->hosts, &s->n_hosts, &s->cap_hosts, h) != 0) {
         free(h);
         return NULL;
     }
     h->hnext = s->host_hash[bucket];            /* wstawiamy na początek listy */
     s->host_hash[bucket] = h;
+    if (s->n_hosts > s->host_hash_size && host_hash_grow(s) != 0)
+        return NULL;
     return h;
 }
 
@@ -238,11 +288,11 @@ static int sender_is_client(const packet_t *p)
  */
 static flow_t *flow_get(stats_t *s, const packet_t *p, int *dir)
 {
-    uint32_t bucket = hash_flow(p->proto, &p->src, p->sport, &p->dst, p->dport)
-                      & (FLOW_HASH_SIZE - 1);
+    uint32_t hash = hash_flow(p->proto, &p->src, p->sport, &p->dst, p->dport);
+    size_t bucket = hash & (s->flow_hash_size - 1);
 
     for (flow_t *f = s->flow_hash[bucket]; f != NULL; f = f->hnext) {
-        if (f->proto != p->proto)
+        if (f->hash != hash || f->proto != p->proto)
             continue;
         if (f->cport == p->sport && f->sport == p->dport &&
             addr_cmp(&f->cli, &p->src) == 0 && addr_cmp(&f->srv, &p->dst) == 0) {
@@ -261,6 +311,7 @@ static flow_t *flow_get(stats_t *s, const packet_t *p, int *dir)
     if (f == NULL)
         return NULL;
     f->proto = p->proto;
+    f->hash = hash;
     f->first_ts = p->ts;
     f->rtt = -1.0;
     if (sender_is_client(p)) {
@@ -280,6 +331,8 @@ static flow_t *flow_get(stats_t *s, const packet_t *p, int *dir)
     s->flow_hash[bucket] = f;
     if (p->proto == PROTO_TCP) s->tcp_flows++;
     else                       s->udp_flows++;
+    if (s->n_flows > s->flow_hash_size && flow_hash_grow(s) != 0)
+        return NULL;
     return f;
 }
 
@@ -372,10 +425,19 @@ int stats_add_packet(stats_t *s, const packet_t *p)
         if (fl & TCP_PSH) s->f_psh++;
         if (fl == TCP_ACK && p->payload_len == 0) s->f_ack_only++;
         /* Kombinacje flag niewystępujące w normalnym ruchu: */
-        if (fl == 0) s->f_null++;                                       /* NULL scan */
-        if ((fl & (TCP_FIN | TCP_PSH | TCP_URG)) == (TCP_FIN | TCP_PSH | TCP_URG))
-            s->f_xmas++;                                                /* XMAS scan */
-        if ((fl & (TCP_SYN | TCP_FIN)) == (TCP_SYN | TCP_FIN)) s->f_synfin++;
+        int odd = 0;
+        if (fl == 0) { s->f_null++; odd = 1; }                          /* NULL scan */
+        if ((fl & (TCP_FIN | TCP_PSH | TCP_URG)) == (TCP_FIN | TCP_PSH | TCP_URG)) {
+            s->f_xmas++; odd = 1;                                       /* XMAS scan */
+        }
+        if ((fl & (TCP_SYN | TCP_FIN)) == (TCP_SYN | TCP_FIN)) { s->f_synfin++; odd = 1; }
+        if (odd) {
+            if (s->odd_first_ts == 0) {                       /* pierwszy taki pakiet */
+                s->odd_first_ts = p->ts;
+                s->odd_src = p->src;
+            }
+            s->odd_last_ts = p->ts;
+        }
     } else {
         proto_idx = 1;
         s->udp_pkts++;
@@ -413,22 +475,38 @@ int stats_add_packet(stats_t *s, const packet_t *p)
     return 0;
 }
 
-const char *flow_state_str(const flow_t *f)
+flow_state_t flow_state(const flow_t *f)
 {
     if (f->proto != PROTO_TCP)
-        return "UDP";
+        return FS_UDP;
     int rst = (f->flags[0] | f->flags[1]) & TCP_RST;
     int fin = (f->flags[0] | f->flags[1]) & TCP_FIN;
     if (f->handshake & HS_ACK) {
-        if (rst) return "nawiązane, zerwane RST";
-        if (fin) return "nawiązane, zamknięte FIN";
-        return "nawiązane, otwarte";
+        if (rst) return FS_EST_RST;
+        if (fin) return FS_EST_FIN;
+        return FS_EST_OPEN;
     }
-    if ((f->handshake & HS_SYN) && rst)        return "odrzucone (RST)";
+    if ((f->handshake & HS_SYN) && rst)        return FS_REJECTED;
     if ((f->handshake & HS_SYN) && (f->handshake & HS_SYNACK))
-        return "półotwarte (brak ACK)";
-    if (f->handshake & HS_SYN)                 return "brak odpowiedzi na SYN";
-    return "w trakcie (bez handshake)";
+        return FS_HALF_OPEN;
+    if (f->handshake & HS_SYN)                 return FS_NO_REPLY;
+    return FS_MIDSTREAM;
+}
+
+const char *flow_state_name(flow_state_t st)
+{
+    /* Tablica napisów indeksowana wartością enum - musi mieć tę samą kolejność. */
+    static const char *names[FS_COUNT] = {
+        "nawiązane, zamknięte FIN", "nawiązane, otwarte", "nawiązane, zerwane RST",
+        "odrzucone (RST)", "brak odpowiedzi na SYN", "półotwarte (brak ACK)",
+        "w trakcie (bez handshake)", "UDP"
+    };
+    return (st < FS_COUNT) ? names[st] : "?";
+}
+
+const char *flow_state_str(const flow_t *f)
+{
+    return flow_state_name(flow_state(f));
 }
 
 /* Tablica struktur zainicjalizowana "w miejscu" - wygodny sposób na słownik. */

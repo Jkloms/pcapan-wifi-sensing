@@ -48,6 +48,7 @@ typedef struct flow {
     uint8_t   seq_valid[2];      /* czy next_seq jest już ustawione */
     uint32_t  retrans;           /* liczba retransmisji w tym przepływie */
 
+    uint32_t  hash;              /* zapamiętany hash - szybsze porównania i powiększanie tablicy */
     struct flow *hnext;          /* następny element w tym samym kubełku tablicy haszującej */
 } flow_t;
 
@@ -56,6 +57,7 @@ typedef struct host {
     ip_addr_t addr;
     uint64_t  pkts_out, bytes_out;   /* wysłane */
     uint64_t  pkts_in,  bytes_in;    /* odebrane */
+    uint32_t  hash;
     struct host *hnext;
 } host_t;
 
@@ -65,9 +67,11 @@ typedef struct {
     uint64_t bytes[2];
 } tl_bucket_t;
 
-/* Rozmiary tablic haszujących (liczba kubełków). Potęga dwójki -> szybkie "& (N-1)". */
-#define FLOW_HASH_SIZE (1u << 16)
-#define HOST_HASH_SIZE (1u << 12)
+/* Początkowe rozmiary tablic haszujących (liczba kubełków). Potęga dwójki
+ * -> numer kubełka liczymy szybkim "& (N-1)" zamiast dzielenia modulo.
+ * Tablice same się podwajają, gdy elementów jest więcej niż kubełków. */
+#define FLOW_HASH_INIT (1u << 12)
+#define HOST_HASH_INIT (1u << 10)
 
 /* Główna struktura ze wszystkimi statystykami. */
 typedef struct {
@@ -84,6 +88,8 @@ typedef struct {
     /* --- flagi TCP (liczba pakietów) --- */
     uint64_t f_syn, f_synack, f_fin, f_rst, f_psh, f_ack_only;
     uint64_t f_null, f_xmas, f_synfin;  /* nietypowe kombinacje - typowe dla skanerów */
+    double   odd_first_ts, odd_last_ts; /* kiedy widziano nietypowe flagi */
+    ip_addr_t odd_src;                  /* nadawca pierwszego takiego pakietu */
     uint64_t tcp_retrans;               /* suma retransmisji */
 
     /* --- histogram rozmiarów --- */
@@ -100,11 +106,13 @@ typedef struct {
 
     /* --- hosty: tablica haszująca + lista do iteracji --- */
     host_t  **host_hash;
+    size_t    host_hash_size;
     host_t  **hosts;         /* tablica wskaźników na wszystkie hosty */
     size_t    n_hosts, cap_hosts;
 
     /* --- przepływy: tablica haszująca + lista do iteracji --- */
     flow_t  **flow_hash;
+    size_t    flow_hash_size;
     flow_t  **flows;
     size_t    n_flows, cap_flows;
     uint64_t  tcp_flows, udp_flows;
@@ -122,7 +130,23 @@ void stats_add_other(stats_t *s, const packet_t *p, int bad);
 /* Czas trwania przechwytywania w sekundach. */
 double stats_duration(const stats_t *s);
 
-/* Krótki opis stanu przepływu TCP, np. "nawiązane, zamknięte FIN". */
+/* Stan przepływu - jak zakończyło się połączenie. */
+typedef enum {
+    FS_EST_FIN,      /* nawiązane, zamknięte FIN (poprawnie) */
+    FS_EST_OPEN,     /* nawiązane, nadal otwarte */
+    FS_EST_RST,      /* nawiązane, zerwane RST */
+    FS_REJECTED,     /* odrzucone (RST na SYN) */
+    FS_NO_REPLY,     /* brak odpowiedzi na SYN */
+    FS_HALF_OPEN,    /* SYN, SYN+ACK, ale brak ACK */
+    FS_MIDSTREAM,    /* nagranie zaczęło się w trakcie połączenia */
+    FS_UDP,          /* przepływ UDP */
+    FS_COUNT         /* liczba stanów - przydatne do tablic */
+} flow_state_t;
+
+flow_state_t flow_state(const flow_t *f);
+const char  *flow_state_name(flow_state_t st);
+
+/* Krótki opis stanu przepływu, np. "nawiązane, zamknięte FIN". */
 const char *flow_state_str(const flow_t *f);
 
 /* Nazwa popularnej usługi dla portu (np. 443 -> "HTTPS") albo NULL. */
