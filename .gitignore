@@ -1,4 +1,9 @@
+# wyniki kompilacji
 pcapan
 *.o
 tools/gen_pcap
+# pliki generowane
 samples/*.pcap
+raport/
+# edytor
+.vscode/
