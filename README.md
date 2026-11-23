@@ -1,12 +1,19 @@
 # pcapan: wykrywanie ruchu człowieka i zakłóceń w Wi-Fi (WiFi sensing)
 
-Projekt hackathonowy napisany w C. Program czyta nagranie sieci Wi-Fi (`.pcap`) i robi trzy rzeczy:
+Projekt hackathonowy napisany w C.
+
+**Autorzy:** Bartosz Filipkowski, Jan Kłomski, Natalia Gałązka, Alexander Grajewski  
+**Politechnika Gdańska ETI**
+
+👉 Przykładowy raport: [`raport_przykladowy.pdf`](raport_przykladowy.pdf) (w głównym folderze).
+
+Program czyta nagranie sieci Wi-Fi (`.pcap`) i robi trzy rzeczy:
 
 1. **Szuka ruchu człowieka.** Kiedy ktoś chodzi po pokoju, fale radiowe odbijają się od niego inaczej, więc siła sygnału (RSSI) zaczyna skakać. Okresy, w których tak się dzieje, zaznaczamy na wykresach.
 2. **Wykrywa zakłócenia.** Bierzemy pod uwagę zakłócenia radiowe (dużo powtórzonych ramek, wyższy szum) oraz problemy łącza (wzrost RTT, retransmisje TCP, przerwy w ruchu).
 3. **Analizuje ruch TCP/UDP.** Liczy pakiety, przepływy i usługi, a dodatkowo wykrywa proste ataki (skan portów, SYN flood, UDP flood).
 
-Wynik zapisuje w katalogu `raport/`: 4-stronicowy `raport.pdf`, 10 wykresów PNG i pliki CSV.
+Wynik trafia do folderu `raport/`: 4-stronicowy `raport.pdf`, 10 wykresów PNG i pliki CSV.
 
 ## Uruchomienie (Ubuntu)
 
@@ -19,6 +26,33 @@ make example         # raport dla samples/wifi_mix.pcap -> examples/wifi_mix/
 ```
 
 Własne nagranie zrobisz kartą Wi-Fi w trybie monitor, np. `sudo airmon-ng start wlan0`, a potem `sudo tcpdump -i wlan0mon -w moje.pcap`. Plik musi mieć nagłówki radiotap. Zwykłe nagrania z Ethernetu też działają, tylko bez części radiowej.
+
+## Struktura plików
+
+```
+pcapan/
+├── raport_przykladowy.pdf   gotowy raport dla samples/wifi_mix.pcap
+├── README.md                ten opis
+├── Makefile                 budowanie: make, make samples, make example
+├── src/                     kod programu
+│   ├── main.c               start programu, kolejność kroków
+│   ├── common.h/.c          wspólne typy (pakiet, adres IP)
+│   ├── parser.h/.c          czytanie .pcap, dekodowanie nagłówków
+│   ├── stats.h/.c           liczniki, oś czasu, RSSI, przepływy
+│   ├── sensing.h/.c         wykrywanie ruchu i zakłóceń
+│   ├── anomaly.h/.c         wykrywanie ataków (dodatek)
+│   ├── charts.h/.c          rysowanie wykresów (cairo)
+│   ├── plots.h/.c           lista wykresów raportu
+│   ├── report.h/.c          raport PDF
+│   └── export.h/.c          pliki CSV
+├── tools/
+│   ├── gen_pcap.c           generator plików testowych
+│   └── lsan.supp            wyciszenie fałszywych alarmów ASan (fontconfig)
+├── samples/                 pliki .pcap (tworzy je `make samples`)
+└── examples/wifi_mix/       wynik `make example`: raport.pdf, wykresy PNG, CSV
+```
+
+Po uruchomieniu `./pcapan plik.pcap` wynik trafia do folderu `raport/` (raport.pdf + PNG + CSV). Inny folder można podać opcją `-o`.
 
 ## Pliki testowe (`tools/gen_pcap.c`)
 
@@ -78,3 +112,8 @@ plik.pcap -> parser -> stats -> sensing (ruch, zakłócenia, łącze) --+-> plot
 - Ruch rozpoznajemy tylko po RSSI. Prawdziwe systemy WiFi sensing używają CSI (dane z wielu podnośnych), których zwykła karta nie zapisuje do pcap.
 - Progi są dobrane pod nasze pliki testowe. Dla innego pomieszczenia trzeba je sprawdzić na nagraniu "pustego pokoju".
 - Szyfrowane ramki Wi-Fi (WPA2) są liczone do RSSI, ale ich zawartości TCP/UDP nie analizujemy.
+
+## Autorzy
+
+Bartosz Filipkowski, Jan Kłomski, Natalia Gałązka, Alexander Grajewski  
+Politechnika Gdańska, Wydział Elektroniki, Telekomunikacji i Informatyki (ETI)

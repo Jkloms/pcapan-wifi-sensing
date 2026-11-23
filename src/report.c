@@ -17,6 +17,9 @@
 #define MARGIN   40.0
 #define CONTENT  (PAGE_W - 2 * MARGIN)
 
+#define AUTHORS "Autorzy: Bartosz Filipkowski, Jan Kłomski, Natalia Gałązka, " \
+                "Alexander Grajewski  |  Politechnika Gdańska ETI"
+
 typedef struct {
     cairo_t    *cr;
     double      y;              /* bieżąca pozycja w pionie */
@@ -84,7 +87,7 @@ static void footer(pdf_t *p)
     char buf[160];
     font(cr, 8, 0);
     rgb(cr, 0x52514E);
-    snprintf(buf, sizeof buf, "pcapan  |  %s", p->file);
+    snprintf(buf, sizeof buf, "pcapan  |  %s  |  Politechnika Gdańska ETI", p->file);
     text_fit(cr, MARGIN, PAGE_H - 22, buf, CONTENT - 80);
     snprintf(buf, sizeof buf, "strona %d / %d", p->page, p->pages);
     text(cr, PAGE_W - MARGIN - text_w(cr, buf), PAGE_H - 22, buf);
@@ -213,7 +216,8 @@ static void page_summary(pdf_t *p, const report_input_t *in)
     font(cr, 9, 0);
     rgb(cr, 0x52514E);
     text_fit(cr, MARGIN, p->y + 38, buf, CONTENT);
-    p->y += 54;
+    text_fit(cr, MARGIN, p->y + 51, AUTHORS, CONTENT);
+    p->y += 66;
 
     /* kafelki */
     int n_link = sensing_count(x, EV_DELAY) + sensing_count(x, EV_RETRANS) +
@@ -327,6 +331,8 @@ int report_write(const report_input_t *in)
         return -1;
     }
     cairo_pdf_surface_set_metadata(surf, CAIRO_PDF_METADATA_TITLE, "pcapan - raport");
+    cairo_pdf_surface_set_metadata(surf, CAIRO_PDF_METADATA_AUTHOR,
+        "Bartosz Filipkowski, Jan Kłomski, Natalia Gałązka, Alexander Grajewski (PG ETI)");
 
     const analysis_t *an = &in->an;
     int radio = an->x->ref_tx >= 0 || an->s->wifi_frames > 0;

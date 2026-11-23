@@ -27,6 +27,7 @@ samples: tools/gen_pcap
 
 example: pcapan samples
 	./pcapan -o examples/wifi_mix samples/wifi_mix.pcap
+	cp examples/wifi_mix/raport.pdf raport_przykladowy.pdf
 
 debug: clean
 	$(MAKE) pcapan CFLAGS="-O0 -g -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined"
