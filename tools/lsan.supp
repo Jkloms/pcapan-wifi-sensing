@@ -1,0 +1,4 @@
+# Znane "wycieki" wewnątrz bibliotek systemowych (pamięć podręczna fontconfig),
+# niezwiązane z naszym kodem. Użycie:
+#   LSAN_OPTIONS=suppressions=tools/lsan.supp ./pcapan plik.pcap
+leak:libfontconfig
