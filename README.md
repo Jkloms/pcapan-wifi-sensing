@@ -33,7 +33,6 @@ Własne nagranie zrobisz kartą Wi-Fi w trybie monitor, np. `sudo airmon-ng star
 pcapan/
 ├── raport_przykladowy.pdf   gotowy raport dla samples/wifi_mix.pcap
 ├── README.md                ten opis
-├── LICENSE                  licencja MIT
 ├── Makefile                 budowanie: make, make samples, make example
 ├── src/                     kod programu
 │   ├── main.c               start programu, kolejność kroków
@@ -118,5 +117,3 @@ plik.pcap -> parser -> stats -> sensing (ruch, zakłócenia, łącze) --+-> plot
 
 Bartosz Filipkowski, Jan Kłomski, Natalia Gałązka, Alexander Grajewski  
 Politechnika Gdańska, Wydział Elektroniki, Telekomunikacji i Informatyki (ETI)
-
-Licencja: MIT (plik `LICENSE`).
