@@ -1,31 +1,26 @@
 /*
- * gen_pcap.c - generator przykładowych plików .pcap do testowania pcapan.
+ * gen_pcap.c - generator plików testowych dla pcapan.
  *
- * Program "fabrykuje" pakiety Ethernet/IPv4(IPv6)/TCP/UDP bajt po bajcie
- * i zapisuje je funkcjami libpcap (pcap_open_dead + pcap_dump), bez
- * potrzeby przechwytywania prawdziwego ruchu ani uprawnień roota.
+ * Buduje pakiety bajt po bajcie i zapisuje je przez libpcap (pcap_dump).
+ * Pliki Wi-Fi mają nagłówek radiotap z RSSI i szumem, a "ruch człowieka"
+ * symulujemy większymi wahaniami RSSI w wybranych okresach.
  *
- * Tworzone scenariusze (pliki w katalogu podanym jako argument):
- *   normal.pcap    - zwykły ruch: HTTP/HTTPS, DNS, NTP, trochę ARP i IPv6
- *   portscan.pcap  - zwykły ruch + skanowanie portów (SYN, NULL, XMAS)
- *   synflood.pcap  - zwykły ruch + atak SYN flood z fałszywych adresów
- *   udpflood.pcap  - zwykły ruch + zalew pakietami UDP
- *   retrans.pcap   - połączenia TCP na łączu gubiącym pakiety (retransmisje)
- *   mixed.pcap     - wszystko naraz (do przykładowego raportu)
+ *   wifi_spokoj.pcap      - pusty pokój, normalny ruch sieciowy
+ *   wifi_ruch.pcap        - 3 okresy ruchu
+ *   wifi_zaklocenia.pcap  - zakłócenia radiowe, wolne łącze, przerwa
+ *   wifi_mix.pcap         - wszystko naraz (przykładowy raport)
+ *   eth_ataki.pcap        - Ethernet: skan portów, SYN flood, UDP flood
  *
- * Użycie: ./tools/gen_pcap KATALOG        (6 przykładowych plików)
- *        ./tools/gen_pcap KATALOG big    (duży plik do testów wydajności)
+ * Użycie: ./tools/gen_pcap KATALOG   albo   ./tools/gen_pcap KATALOG big
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <pcap/pcap.h>
 
-/* ------------------------------------------------------------------ */
-/* Bufor pakietów: zbieramy wszystko w pamięci, sortujemy po czasie     */
-/* i dopiero wtedy zapisujemy (pcap powinien mieć pakiety po kolei).   */
-/* ------------------------------------------------------------------ */
+/* Pakiety zbieramy w pamięci, sortujemy po czasie i dopiero zapisujemy. */
 
 #define MAX_PKT 1600
 
@@ -38,6 +33,7 @@ typedef struct {
 typedef struct {
     rawpkt_t *pkts;
     size_t n, cap;
+    int wifi;          /* 1 = radiotap + 802.11 zamiast Ethernetu */
 } capture_t;
 
 static rawpkt_t *cap_new(capture_t *c, double ts)
@@ -86,7 +82,7 @@ static int cmp_ts(const void *a, const void *b)
 static int cap_write(capture_t *c, const char *path)
 {
     qsort(c->pkts, c->n, sizeof *c->pkts, cmp_ts);
-    pcap_t *dead = pcap_open_dead(DLT_EN10MB, 65535);   /* "martwy" uchwyt - tylko do zapisu */
+    pcap_t *dead = pcap_open_dead(c->wifi ? DLT_IEEE802_11_RADIO : DLT_EN10MB, 65535);
     pcap_dumper_t *d = pcap_dump_open(dead, path);
     if (d == NULL) {
         fprintf(stderr, "%s: %s\n", path, pcap_geterr(dead));
@@ -106,9 +102,7 @@ static int cap_write(capture_t *c, const char *path)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Losowość (własny prosty generator - wyniki powtarzalne)              */
-/* ------------------------------------------------------------------ */
+/* Własny generator liczb losowych - stałe ziarno = powtarzalne pliki. */
 
 static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 
@@ -122,9 +116,11 @@ static uint32_t rnd(void)            /* algorytm xorshift64 */
 
 static double rnd01(void) { return (rnd() & 0xFFFFFF) / (double)0x1000000; }
 
-/* ------------------------------------------------------------------ */
-/* Budowanie nagłówków                                                 */
-/* ------------------------------------------------------------------ */
+static double gauss(void)            /* rozkład normalny N(0,1), metoda Boxa-Mullera */
+{
+    double u = rnd01() + 1e-9, v = rnd01();
+    return sqrt(-2 * log(u)) * cos(2 * M_PI * v);
+}
 
 static void wr16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v & 0xFF; }
 static void wr32(uint8_t *p, uint32_t v) { wr16(p, v >> 16); wr16(p + 2, v & 0xFFFF); }
@@ -159,6 +155,103 @@ static void eth_header(uint8_t *p, uint32_t src_ip, uint32_t dst_ip, uint16_t et
     memcpy(p, dst, 6);
     memcpy(p + 6, src, 6);
     wr16(p + 12, ethertype);
+}
+
+/* ---- Wi-Fi: model otoczenia ---- */
+
+typedef struct { double t0, t1; } period_t;
+
+static struct {
+    period_t motion[4];  int n_motion;     /* ktoś chodzi po pokoju */
+    period_t interf[2];  int n_interf;     /* obce źródło sygnału na kanale */
+    period_t slow;                         /* wolne, gubiące pakiety łącze */
+    period_t gap;                          /* brak ruchu sieciowego */
+} env;
+
+static int in(const period_t *p, int n, double t)
+{
+    for (int i = 0; i < n; i++)
+        if (t >= p[i].t0 && t < p[i].t1)
+            return 1;
+    return 0;
+}
+
+static const uint8_t BSSID[6] = { 0x02, 0xAA, 0x00, 0x00, 0x00, 0x01 };
+
+/* Radiotap (16 B): flags, rate, channel, sygnał dBm, szum dBm. */
+static void radiotap(uint8_t *p, double ts, int base_rssi)
+{
+    double rssi = base_rssi + 0.7 * gauss();
+    if (in(env.motion, env.n_motion, ts))   /* ruch: odbicia od ciała zmieniają sygnał */
+        rssi = base_rssi + 4 * sin(2 * M_PI * ts / 1.7) + 3 * gauss();
+    int bad = in(env.interf, env.n_interf, ts);
+    double noise = bad ? -80 + 2 * gauss() : -95 + gauss();
+
+    memset(p, 0, 16);
+    p[2] = 16;                                 /* długość nagłówka (LE) */
+    p[4] = 0x6E;                               /* present: bity 1,2,3,5,6 */
+    p[9] = 108;                                /* 54 Mb/s w jednostkach 500 kb/s */
+    p[10] = 2437 & 0xFF; p[11] = 2437 >> 8;    /* kanał 6 */
+    p[12] = 0xC0;                              /* 2,4 GHz, OFDM */
+    p[14] = (uint8_t)(int8_t)lround(rssi);
+    p[15] = (uint8_t)(int8_t)lround(noise);
+}
+
+static int retry_bit(double ts)
+{
+    double prob = in(env.interf, env.n_interf, ts) ? 0.4 : 0.03;
+    return rnd01() < prob ? 0x08 : 0;
+}
+
+static void mac_of(uint8_t *m, uint32_t ip)
+{
+    m[0] = 0x02; m[1] = 0x00;
+    wr32(m + 2, ip);
+}
+
+/* Warstwa łącza: Ethernet albo radiotap + 802.11 + LLC/SNAP. Zwraca długość. */
+static size_t link_header(capture_t *c, uint8_t *p, double ts, uint32_t src, uint32_t dst,
+                          uint16_t ethertype)
+{
+    if (!c->wifi) {
+        eth_header(p, src, dst, ethertype);
+        return 14;
+    }
+    int from_client = (src >> 24) == 10;       /* 10.x.x.x = sieć lokalna */
+    uint32_t cli = from_client ? src : dst;
+    radiotap(p, ts, from_client ? -56 - (int)(cli & 7) : -48);
+    uint8_t *w = p + 16;
+    w[0] = 0x08;                               /* ramka danych */
+    w[1] = (from_client ? 0x01 : 0x02) | retry_bit(ts);   /* ToDS / FromDS */
+    uint8_t a_cli[6], a_other[6];
+    mac_of(a_cli, cli);
+    mac_of(a_other, from_client ? dst : src);
+    memcpy(w + 4,  from_client ? BSSID : a_cli, 6);        /* odbiorca */
+    memcpy(w + 10, from_client ? a_cli : BSSID, 6);        /* nadawca */
+    memcpy(w + 16, a_other, 6);
+    uint8_t *llc = w + 24;
+    llc[0] = 0xAA; llc[1] = 0xAA; llc[2] = 0x03;
+    llc[3] = llc[4] = llc[5] = 0;
+    wr16(llc + 6, ethertype);
+    return 16 + 24 + 8;
+}
+
+/* Beacon punktu dostępowego (co 102,4 ms). */
+static void add_beacon(capture_t *c, double ts)
+{
+    rawpkt_t *p = cap_new(c, ts);
+    radiotap(p->data, ts, -48);
+    uint8_t *w = p->data + 16;
+    w[0] = 0x80;                               /* zarządzanie, beacon */
+    memset(w + 4, 0xFF, 6);
+    memcpy(w + 10, BSSID, 6);
+    memcpy(w + 16, BSSID, 6);
+    uint8_t *body = w + 24;                    /* timestamp(8) interval(2) capab(2) SSID */
+    wr16(body + 8, 0x6400);
+    body[12] = 0;
+    body[13] = 7;
+    memcpy(body + 14, "HackNet", 7);
+    cap_done(p, 16 + 24 + 14 + 7);
 }
 
 /* Nagłówek IPv4 (20 bajtów) z sumą kontrolną. */
@@ -198,10 +291,10 @@ static void add_tcp(capture_t *c, double ts, uint32_t src, uint32_t dst,
 {
     if (payload > 1460) payload = 1460;
     rawpkt_t *p = cap_new(c, ts);
-    uint8_t *eth = p->data, *ip = eth + 14, *tcp = ip + 20;
+    size_t l2 = link_header(c, p->data, ts, src, dst, 0x0800);
+    uint8_t *ip = p->data + l2, *tcp = ip + 20;
     uint16_t tcp_len = 20 + payload;
 
-    eth_header(eth, src, dst, 0x0800);
     ipv4_header(ip, src, dst, 6, 20 + tcp_len, 64);
     wr16(tcp, sport);
     wr16(tcp + 2, dport);
@@ -213,7 +306,7 @@ static void add_tcp(capture_t *c, double ts, uint32_t src, uint32_t dst,
     for (int i = 0; i < payload; i++)
         tcp[20 + i] = 'a' + (i % 26);
     wr16(tcp + 16, l4_checksum_v4(src, dst, 6, tcp, tcp_len));
-    cap_done(p, 14 + 20 + tcp_len);
+    cap_done(p, l2 + 20 + tcp_len);
 }
 
 static void add_udp(capture_t *c, double ts, uint32_t src, uint32_t dst,
@@ -221,10 +314,10 @@ static void add_udp(capture_t *c, double ts, uint32_t src, uint32_t dst,
 {
     if (payload > 1472) payload = 1472;
     rawpkt_t *p = cap_new(c, ts);
-    uint8_t *eth = p->data, *ip = eth + 14, *udp = ip + 20;
+    size_t l2 = link_header(c, p->data, ts, src, dst, 0x0800);
+    uint8_t *ip = p->data + l2, *udp = ip + 20;
     uint16_t udp_len = 8 + payload;
 
-    eth_header(eth, src, dst, 0x0800);
     ipv4_header(ip, src, dst, 17, 20 + udp_len, 64);
     wr16(udp, sport);
     wr16(udp + 2, dport);
@@ -232,7 +325,7 @@ static void add_udp(capture_t *c, double ts, uint32_t src, uint32_t dst,
     for (int i = 0; i < payload; i++)
         udp[8 + i] = (uint8_t)rnd();
     wr16(udp + 6, l4_checksum_v4(src, dst, 17, udp, udp_len));
-    cap_done(p, 14 + 20 + udp_len);
+    cap_done(p, l2 + 20 + udp_len);
 }
 
 /* Pakiet UDP w IPv6 (adresy fe80::X), żeby przetestować obsługę IPv6. */
@@ -240,9 +333,9 @@ static void add_udp6(capture_t *c, double ts, uint8_t src_last, uint8_t dst_last
                      uint16_t sport, uint16_t dport, uint16_t payload)
 {
     rawpkt_t *p = cap_new(c, ts);
-    uint8_t *eth = p->data, *ip = eth + 14, *udp = ip + 40;
+    size_t l2 = link_header(c, p->data, ts, IP(10, 0, 0, src_last), IP(10, 0, 0, dst_last), 0x86DD);
+    uint8_t *ip = p->data + l2, *udp = ip + 40;
     uint16_t udp_len = 8 + payload;
-    eth_header(eth, src_last, dst_last, 0x86DD);
     ip[0] = 0x60;                    /* wersja 6 */
     wr16(ip + 4, udp_len);
     ip[6] = 17;                      /* next header = UDP */
@@ -252,31 +345,23 @@ static void add_udp6(capture_t *c, double ts, uint8_t src_last, uint8_t dst_last
     wr16(udp, sport);
     wr16(udp + 2, dport);
     wr16(udp + 4, udp_len);
-    cap_done(p, 14 + 40 + udp_len);
+    cap_done(p, l2 + 40 + udp_len);
 }
 
 /* Ramka ARP - nie jest IP, więc analizator policzy ją jako "inne". */
 static void add_arp(capture_t *c, double ts, uint32_t src, uint32_t target)
 {
     rawpkt_t *p = cap_new(c, ts);
-    eth_header(p->data, src, 0xFFFFFFFF, 0x0806);
-    uint8_t *a = p->data + 14;
+    size_t l2 = link_header(c, p->data, ts, src, 0xFFFFFFFF, 0x0806);
+    uint8_t *a = p->data + l2;
     wr16(a, 1); wr16(a + 2, 0x0800); a[4] = 6; a[5] = 4; wr16(a + 6, 1);
     wr32(a + 14, src);
     wr32(a + 24, target);
-    cap_done(p, 14 + 28);
+    cap_done(p, l2 + 28);
 }
 
-/* ------------------------------------------------------------------ */
-/* Scenariusze                                                         */
-/* ------------------------------------------------------------------ */
-
-/*
- * Pełna sesja TCP: handshake, żądanie, odpowiedź (w segmentach po 1460 B),
- * zamknięcie FIN. 'loss' to prawdopodobieństwo zgubienia segmentu danych
- * serwera - zgubiony segment jest wysyłany ponownie (retransmisja).
- * Zwraca czas zakończenia sesji.
- */
+/* Sesja TCP: handshake, żądanie, odpowiedź w segmentach, FIN. "loss" = szansa
+ * zgubienia segmentu (wtedy retransmisja). Zwraca czas końca sesji. */
 static double tcp_session(capture_t *c, double t, uint32_t cli, uint16_t cport,
                           uint32_t srv, uint16_t sport, int req, int resp,
                           double rtt, double loss)
@@ -326,9 +411,16 @@ static void normal_traffic(capture_t *c, double t0, double dur, double loss)
 
     double t = t0;
     while (t < t0 + dur) {
+        if (t >= env.gap.t0 && t < env.gap.t1) {   /* przerwa - nic nie wysyłamy */
+            t = env.gap.t1;
+            continue;
+        }
+        int slow = t >= env.slow.t0 && t < env.slow.t1;
         uint32_t cli = IP(10, 0, 0, 10 + rnd() % 15);
         int s = rnd() % 5;
-        uint16_t cport = 40000 + rnd() % 20000;
+        static uint16_t next_port = 40000;
+        uint16_t cport = next_port;
+        next_port = next_port >= 59990 ? 40000 : next_port + 2;   /* bez powtórzeń portów */
 
         /* zapytanie DNS przed połączeniem */
         add_udp(c, t, cli, DNS_SRV, cport + 1, 53, 40);
@@ -338,7 +430,8 @@ static void normal_traffic(capture_t *c, double t0, double dur, double loss)
         if (rnd() % 20 == 0)
             resp = 100000 + rnd() % 200000;     /* czasem większy transfer */
         tcp_session(c, t + 0.004, cli, cport, servers[s], ports[s], 200 + rnd() % 400,
-                    resp, rtts[s] * (0.8 + 0.4 * rnd01()), loss);
+                    resp, rtts[s] * (0.8 + 0.4 * rnd01()) * (slow ? 8 : 1) + (slow ? 0.15 : 0),
+                    slow ? 0.25 : loss);
 
         if (rnd() % 8 == 0) {                    /* synchronizacja czasu NTP */
             add_udp(c, t + 0.1, cli, IP(162, 159, 200, 1), 123, 123, 48);
@@ -406,17 +499,44 @@ static void udp_flood(capture_t *c, double t0)
                 1 + rnd() % 65000, 512);
 }
 
-/* Ustawia ziarno, generuje scenariusz i zapisuje plik. */
 typedef void (*scenario_fn)(capture_t *);   /* wskaźnik na funkcję */
 
 static const double T0 = 1763906400.0;      /* 2025-11-23 14:00:00 UTC */
 
-static void sc_normal(capture_t *c)   { normal_traffic(c, T0, 60, 0.0); }
-static void sc_portscan(capture_t *c) { normal_traffic(c, T0, 60, 0.0); port_scan(c, T0 + 20); }
-static void sc_synflood(capture_t *c) { normal_traffic(c, T0, 60, 0.0); syn_flood(c, T0 + 30); }
-static void sc_udpflood(capture_t *c) { normal_traffic(c, T0, 60, 0.0); udp_flood(c, T0 + 40); }
-static void sc_retrans(capture_t *c)  { normal_traffic(c, T0, 60, 0.08); }
-static void sc_mixed(capture_t *c)
+static void wifi(capture_t *c, double dur)
+{
+    c->wifi = 1;
+    for (double t = T0; t < T0 + dur; t += 0.1024)
+        add_beacon(c, t);
+    normal_traffic(c, T0, dur, 0.0);
+}
+
+#define P(a, b) (period_t){ T0 + (a), T0 + (b) }
+
+static void sc_spokoj(capture_t *c) { wifi(c, 120); }
+static void sc_ruch(capture_t *c)
+{
+    env.motion[0] = P(20, 35); env.motion[1] = P(60, 68); env.motion[2] = P(90, 110);
+    env.n_motion = 3;
+    wifi(c, 120);
+}
+static void sc_zaklocenia(capture_t *c)
+{
+    env.interf[0] = P(30, 50); env.n_interf = 1;
+    env.slow = P(70, 80);
+    env.gap = P(95, 100);
+    wifi(c, 120);
+}
+static void sc_mix(capture_t *c)
+{
+    env.motion[0] = P(15, 30); env.motion[1] = P(100, 118); env.motion[2] = P(150, 160);
+    env.n_motion = 3;
+    env.interf[0] = P(45, 60); env.n_interf = 1;
+    env.slow = P(75, 85);
+    env.gap = P(128, 133);
+    wifi(c, 180);
+}
+static void sc_ataki(capture_t *c)
 {
     normal_traffic(c, T0, 120, 0.02);
     port_scan(c, T0 + 20);
@@ -449,14 +569,15 @@ int main(int argc, char **argv)
         return 2;
     }
     const struct { const char *name; scenario_fn fn; } list[] = {
-        { "normal.pcap", sc_normal },     { "portscan.pcap", sc_portscan },
-        { "synflood.pcap", sc_synflood }, { "udpflood.pcap", sc_udpflood },
-        { "retrans.pcap", sc_retrans },   { "mixed.pcap", sc_mixed },
+        { "wifi_spokoj.pcap", sc_spokoj }, { "wifi_ruch.pcap", sc_ruch },
+        { "wifi_zaklocenia.pcap", sc_zaklocenia }, { "wifi_mix.pcap", sc_mix },
+        { "eth_ataki.pcap", sc_ataki },
     };
     printf("Generowanie przykładowych plików:\n");
     for (size_t i = 0; i < sizeof list / sizeof list[0]; i++) {
         capture_t c = { 0 };
-        rng_state = 0x9E3779B97F4A7C15ull + i;   /* stałe ziarno = powtarzalne pliki */
+        memset(&env, 0, sizeof env);
+        rng_state = 0x9E3779B97F4A7C15ull + i;
         list[i].fn(&c);
         char path[512];
         snprintf(path, sizeof path, "%s/%s", argv[1], list[i].name);

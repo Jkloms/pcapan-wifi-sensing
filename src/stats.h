@@ -1,17 +1,4 @@
-/*
- * stats.h - zbieranie statystyk ruchu.
- *
- * Moduł dostaje pakiety jeden po drugim (stats_add_packet) i aktualizuje:
- *   - liczniki globalne (pakiety, bajty, TCP/UDP),
- *   - oś czasu (ruch w każdej sekundzie),
- *   - rozkład rozmiarów pakietów,
- *   - statystyki hostów (kto ile wysłał / odebrał),
- *   - statystyki portów usług,
- *   - tabelę PRZEPŁYWÓW (flow) - czyli "rozmów" między dwoma gniazdami.
- *
- * Przepływ = (protokół, IP klienta, port klienta, IP serwera, port serwera).
- * Pakiety w obu kierunkach należą do tego samego przepływu.
- */
+/* stats.h - liczniki ruchu, oś czasu (co 1 s), hosty, przepływy i dane radiowe Wi-Fi. */
 #ifndef PCAPAN_STATS_H
 #define PCAPAN_STATS_H
 
@@ -47,6 +34,9 @@ typedef struct flow {
     uint32_t  next_seq[2];       /* najwyższy oczekiwany numer sekwencyjny */
     uint8_t   seq_valid[2];      /* czy next_seq jest już ustawione */
     uint32_t  retrans;           /* liczba retransmisji w tym przepływie */
+    uint32_t  ack_wait[2];       /* RTT: czekamy na ACK >= ack_wait */
+    double    ack_ts[2];
+    uint8_t   ack_pending[2];
 
     uint32_t  hash;              /* zapamiętany hash - szybsze porównania i powiększanie tablicy */
     struct flow *hnext;          /* następny element w tym samym kubełku tablicy haszującej */
@@ -61,15 +51,30 @@ typedef struct host {
     struct host *hnext;
 } host_t;
 
-/* Ruch w jednej sekundzie (punkt na osi czasu). Indeks [0]=TCP, [1]=UDP. */
+/* Jedna sekunda nagrania. */
 typedef struct {
-    uint32_t pkts[2];
+    uint32_t pkts[2];            /* [0] TCP, [1] UDP */
     uint64_t bytes[2];
+    uint32_t other;              /* inne pakiety / ramki Wi-Fi bez IP */
+    uint32_t retrans;            /* retransmisje TCP */
+    uint32_t rtt_n;              /* próbki RTT (dane -> ACK) */
+    float    rtt_sum;
+    uint32_t wifi, wifi_retry;   /* ramki Wi-Fi i ramki powtórzone */
+    uint32_t noise_n;
+    int32_t  noise_sum;          /* dBm */
 } tl_bucket_t;
 
-/* Początkowe rozmiary tablic haszujących (liczba kubełków). Potęga dwójki
- * -> numer kubełka liczymy szybkim "& (N-1)" zamiast dzielenia modulo.
- * Tablice same się podwajają, gdy elementów jest więcej niż kubełków. */
+/* Nadajnik Wi-Fi (adres MAC) i jego RSSI w każdej sekundzie. */
+#define MAX_TX 32
+typedef struct {
+    uint8_t   mac[6];
+    uint64_t  frames;
+    double    rssi_sum;
+    uint32_t *n;                 /* tablice [sekunda] */
+    double   *sum, *sum2;
+    size_t    cap;
+} radio_tx_t;
+
 #define FLOW_HASH_INIT (1u << 12)
 #define HOST_HASH_INIT (1u << 10)
 
@@ -116,6 +121,11 @@ typedef struct {
     flow_t  **flows;
     size_t    n_flows, cap_flows;
     uint64_t  tcp_flows, udp_flows;
+
+    uint64_t   wifi_frames, wifi_retry;
+    radio_tx_t tx[MAX_TX];
+    size_t     n_tx;
+    uint16_t   freq;             /* kanał (MHz) z pierwszej ramki */
 } stats_t;
 
 /* Tworzy pustą strukturę statystyk (NULL przy braku pamięci). */
@@ -126,6 +136,7 @@ int stats_add_packet(stats_t *s, const packet_t *p);
 
 /* Rejestruje pakiet, który nie jest TCP/UDP ('bad' = 1 jeśli był uszkodzony). */
 void stats_add_other(stats_t *s, const packet_t *p, int bad);
+int  stats_add_radio(stats_t *s, const packet_t *p);   /* po add_packet/add_other */
 
 /* Czas trwania przechwytywania w sekundach. */
 double stats_duration(const stats_t *s);

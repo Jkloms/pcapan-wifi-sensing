@@ -1,28 +1,20 @@
 /*
- * main.c - punkt wejścia programu pcapan.
+ * main.c - pcapan: wykrywanie ruchu człowieka i zakłóceń z nagrań Wi-Fi (.pcap).
  *
- * Przebieg działania (potok / "pipeline"):
- *
- *   plik.pcap --> [parser] --> packet_t --> [stats] --> stats_t
- *                                                          |
- *                       [anomaly] <------------------------+
- *                           |                              |
- *                           v                              v
- *                      anomalies_t --> [plots] --> pliki PNG
- *                                          \
- *                                           --> [report] --> raport.pdf
- *
- * Każdy moduł ma jedną odpowiedzialność i własny plik .c/.h.
+ *   plik.pcap -> parser -> stats -> sensing (ruch, zakłócenia, łącze)
+ *                                -> anomaly (ataki, dodatkowo)
+ *                                -> plots (PNG), export (CSV), report (PDF)
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>      /* getopt */
-#include <sys/stat.h>    /* mkdir */
-#include <cairo.h>       /* tylko dla cairo_debug_reset_static_data */
+#include <unistd.h>
+#include <sys/stat.h>
+#include <cairo.h>
 #include "parser.h"
 #include "stats.h"
+#include "sensing.h"
 #include "anomaly.h"
 #include "plots.h"
 #include "report.h"
@@ -30,94 +22,74 @@
 
 static void usage(const char *prog)
 {
-    /* stderr - strumień na komunikaty diagnostyczne, stdout - na wyniki */
     fprintf(stderr,
-        "Użycie: %s [opcje] plik.pcap\n"
+        "Użycie: %s [-o KATALOG] plik.pcap\n"
         "\n"
-        "Analizuje ruch TCP i UDP z pliku .pcap/.pcapng i tworzy raport PDF oraz wykresy PNG.\n"
+        "Szuka okresów ruchu człowieka (wahania RSSI) i zakłóceń w nagraniu Wi-Fi\n"
+        "(radiotap) oraz analizuje ruch TCP/UDP. Wynik: raport.pdf, wykresy PNG, CSV.\n"
         "\n"
-        "Opcje:\n"
         "  -o KATALOG   katalog wyjściowy (domyślnie: raport)\n"
-        "  -p N         próg skanowania portów: liczba różnych portów (domyślnie 15)\n"
-        "  -n N         próg skanowania sieci: liczba różnych hostów (domyślnie 15)\n"
-        "  -s N         próg SYN flood: niedokończone połączenia (domyślnie 100)\n"
-        "  -r PROCENT   próg retransmisji w %% pakietów TCP (domyślnie 3)\n"
-        "  -u N         próg UDP flood w pakietach/s (domyślnie 500)\n"
-        "  -h           ta pomoc\n"
-        "\n"
-        "Przykład: %s -o wynik samples/mixed.pcap\n", prog, prog);
+        "  -h           pomoc\n", prog);
 }
 
-/* Tworzy katalog; brak błędu, jeśli już istnieje. */
 static int make_dir(const char *path)
 {
     if (mkdir(path, 0755) == 0 || errno == EEXIST)
         return 0;
-    perror(path);   /* wypisuje opis ostatniego błędu systemowego (errno) */
+    perror(path);
     return -1;
 }
 
-/* Krótkie podsumowanie w terminalu. */
-static void print_summary(const stats_t *s, const anomalies_t *a)
+static void print_summary(const stats_t *s, const sensing_t *x, const anomalies_t *a)
 {
-    printf("\n=== Podsumowanie ===\n");
-    printf("Pakiety:      %llu (TCP %llu, UDP %llu, inne %llu, uszkodzone %llu)\n",
+    printf("\nPakiety: %llu (TCP %llu, UDP %llu, ramki Wi-Fi %llu), czas %.0f s\n",
            (unsigned long long)s->total_pkts, (unsigned long long)s->tcp_pkts,
-           (unsigned long long)s->udp_pkts, (unsigned long long)s->other_pkts,
-           (unsigned long long)s->bad_pkts);
-    printf("Bajty:        %llu\n", (unsigned long long)s->total_bytes);
-    printf("Czas trwania: %.2f s\n", stats_duration(s));
-    printf("Hosty:        %zu, przepływy: %zu (TCP %llu, UDP %llu)\n", s->n_hosts,
-           s->n_flows, (unsigned long long)s->tcp_flows, (unsigned long long)s->udp_flows);
-    printf("Retransmisje: %llu\n", (unsigned long long)s->tcp_retrans);
+           (unsigned long long)s->udp_pkts, (unsigned long long)s->wifi_frames,
+           stats_duration(s));
+    if (x->ref_tx >= 0)
+        printf("Próg ruchu: %.1f dB\n", x->motion_thr);
+    else
+        printf("Brak danych radiowych - wykrywanie ruchu pominięte.\n");
 
-    printf("\n=== Wynik ryzyka: %d/100 (%s) ===\n", a->risk_score,
-           risk_level_name(risk_level(a->risk_score)));
-    printf("\n=== Incydenty (%zu) ===\n", a->n);
-    for (size_t i = 0; i < a->n; i++) {
-        const anomaly_t *an = &a->items[i];
-        printf("[%s] %s  |  %s -> %s\n    %s\n", severity_name(an->severity),
-               an->category, an->source, an->target, an->text);
+    printf("\nZdarzenia (%zu):\n", x->n_ev);
+    for (size_t i = 0; i < x->n_ev; i++) {
+        const event_t *e = &x->ev[i];
+        const char *name = event_name(e->type);
+        int chars = 0;                       /* liczba znaków UTF-8, nie bajtów */
+        for (const char *c = name; *c; c++)
+            chars += (*c & 0xC0) != 0x80;
+        printf("  %4.0f-%4.0f s  %s%*s %s\n", e->t0, e->t1, name, 20 - chars, "", e->detail);
     }
-    if (a->n == 0)
-        printf("Brak.\n");
+    if (a->n > 0) {
+        printf("\nAtaki (%zu):\n", a->n);
+        for (size_t i = 0; i < a->n; i++)
+            printf("  %-28s %s\n", a->items[i].category, a->items[i].source);
+    }
 }
 
 int main(int argc, char **argv)
 {
     const char *outdir = "raport";
-    thresholds_t th;
-    thresholds_default(&th);
-
-    /* getopt przetwarza opcje typu "-o wartość". Napis "o:p:..." mówi,
-     * które litery są dozwolone; dwukropek = opcja wymaga wartości. */
     int opt;
-    while ((opt = getopt(argc, argv, "o:p:n:s:r:u:h")) != -1) {
+    while ((opt = getopt(argc, argv, "o:h")) != -1) {
         switch (opt) {
         case 'o': outdir = optarg; break;
-        case 'p': th.scan_min_ports = atoi(optarg); break;
-        case 'n': th.sweep_min_hosts = atoi(optarg); break;
-        case 's': th.synflood_min = atoi(optarg); break;
-        case 'r': th.retrans_ratio = atof(optarg) / 100.0; break;
-        case 'u': th.udpflood_pps = atof(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
     }
-    if (optind != argc - 1) {     /* oczekujemy dokładnie jednego pliku */
+    if (optind != argc - 1) {
         usage(argv[0]);
         return 2;
     }
     const char *input = argv[optind];
 
-    /* ---- 1. Otwarcie pliku ---- */
     char err[256];
     parser_t *parser = parser_open(input, err);
     if (parser == NULL) {
         fprintf(stderr, "Nie można otworzyć %s: %s\n", input, err);
         return 1;
     }
-
     stats_t *stats = stats_create();
     if (stats == NULL) {
         fprintf(stderr, "Brak pamięci\n");
@@ -125,74 +97,63 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ---- 2. Czytanie pakietów i zbieranie statystyk ---- */
-    printf("Analiza pliku %s (łącze: %s)...\n", input, parser_linktype_name(parser));
+    /* 1. czytanie pakietów */
+    printf("Analiza %s (łącze: %s)...\n", input, parser_linktype_name(parser));
     packet_t pkt;
     parse_result_t r;
-    while ((r = parser_next(parser, &pkt)) != PARSE_END) {
-        if (r == PARSE_OK) {
-            if (stats_add_packet(stats, &pkt) != 0) {
-                fprintf(stderr, "Brak pamięci podczas analizy\n");
-                break;
-            }
-        } else {
+    int oom = 0;
+    while (!oom && (r = parser_next(parser, &pkt)) != PARSE_END) {
+        if (r == PARSE_OK)
+            oom = stats_add_packet(stats, &pkt) != 0;
+        else
             stats_add_other(stats, &pkt, r == PARSE_BAD);
-        }
+        if (pkt.has_radio && stats_add_radio(stats, &pkt) != 0)
+            oom = 1;
     }
-    /* Typ łącza kopiujemy, bo po parser_close() napis może przestać istnieć. */
     char linktype[64];
     snprintf(linktype, sizeof linktype, "%s", parser_linktype_name(parser));
     parser_close(parser);
-
+    if (oom)
+        fprintf(stderr, "Brak pamięci podczas analizy - wynik częściowy\n");
     if (stats->total_pkts == 0) {
         fprintf(stderr, "Plik nie zawiera pakietów.\n");
         stats_free(stats);
         return 1;
     }
 
-    /* ---- 3. Wykrywanie anomalii ---- */
-    anomalies_t anomalies;
-    if (anomalies_detect(stats, &th, &anomalies) != 0) {
-        fprintf(stderr, "Brak pamięci podczas wykrywania anomalii\n");
-        anomalies_free(&anomalies);
-        stats_free(stats);
-        return 1;
+    /* 2. wykrywanie */
+    sensing_t sensing;
+    anomalies_t attacks = { 0 };
+    thresholds_t th;
+    thresholds_default(&th);
+    int rc = 0;
+    if (sensing_run(stats, &sensing) != 0 || anomalies_detect(stats, &th, &attacks) != 0) {
+        fprintf(stderr, "Brak pamięci\n");
+        rc = 1;
     }
 
-    /* ---- 4. Wykresy i raport ---- */
-    int rc = 0;
-    if (make_dir(outdir) != 0) {
-        rc = 1;
-    } else {
+    /* 3. wyniki */
+    if (rc == 0 && make_dir(outdir) == 0) {
+        analysis_t an = { stats, &sensing, &attacks };
         int n_png = 0;
-        int errors = plots_generate(stats, &anomalies, outdir, &n_png);
-        if (errors)
-            fprintf(stderr, "Uwaga: %d wykresów nie udało się wygenerować\n", errors);
-        int n_csv = export_csv(stats, &anomalies, outdir);
+        if (plots_generate(&an, outdir, &n_png) != 0)
+            fprintf(stderr, "Uwaga: nie wszystkie wykresy się udały\n");
+        int n_csv = export_csv(&an, outdir);
 
-        char pdf_path[512];
-        snprintf(pdf_path, sizeof pdf_path, "%s/raport.pdf", outdir);
-        report_input_t rin = {
-            .input_path = input,      /* "designated initializers" - pola po nazwie */
-            .linktype   = linktype,
-            .output_pdf = pdf_path,
-            .stats      = stats,
-            .anomalies  = &anomalies,
-            .thresholds = &th,
-        };
+        char pdf[512];
+        snprintf(pdf, sizeof pdf, "%s/raport.pdf", outdir);
+        report_input_t rin = { input, linktype, pdf, an };
         if (report_write(&rin) != 0)
             rc = 1;
-
-        print_summary(stats, &anomalies);
-        printf("\nRaport:      %s\nWykresy PNG: %d plików, CSV: %d plików w katalogu %s/\n",
-               pdf_path, n_png, n_csv, outdir);
+        print_summary(stats, &sensing, &attacks);
+        printf("\nRaport: %s  (+ %d wykresów PNG, %d plików CSV)\n", pdf, n_png, n_csv);
+    } else {
+        rc = 1;
     }
 
-    /* ---- 5. Sprzątanie ---- */
-    anomalies_free(&anomalies);
+    sensing_free(&sensing);
+    anomalies_free(&attacks);
     stats_free(stats);
-    /* Zwalnia wewnętrzne bufory cairo (czcionki) - dzięki temu narzędzia
-     * do wykrywania wycieków pamięci nie zgłaszają fałszywych alarmów. */
-    cairo_debug_reset_static_data();
+    cairo_debug_reset_static_data();   /* żeby ASan nie zgłaszał buforów czcionek */
     return rc;
 }

@@ -1,12 +1,7 @@
 /*
- * stats.c - implementacja zbierania statystyk (opis w stats.h).
- *
- * Najważniejsze techniki użyte w tym pliku:
- *   1. Tablica haszująca z łańcuchowaniem (chaining) - szybkie wyszukiwanie
- *      przepływu/hosta po kluczu. Funkcja haszująca zamienia klucz na numer
- *      kubełka; elementy o tym samym numerze tworzą listę jednokierunkową.
- *   2. Tablica dynamiczna (realloc) - tablica, która rośnie w miarę potrzeb
- *      (podwajamy pojemność, gdy się zapełni).
+ * stats.c - zbieranie statystyk (opis w stats.h).
+ * Przepływy i hosty trzymamy w tablicach haszujących, które rosną (rehash),
+ * a oś czasu to tablica dynamiczna (realloc) - jeden element na sekundę.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -16,13 +11,8 @@ const char *SIZE_BIN_LABELS[SIZE_BINS] = {
     "<64", "64-127", "128-255", "256-511", "512-1023", "1024-1518", ">1518"
 };
 
-/* Ograniczenie długości osi czasu (7 dni po 1 s) - chroni przed zużyciem
- * pamięci, gdy plik ma błędne znaczniki czasu. */
 #define TL_MAX_SECONDS (7u * 24u * 3600u)
 
-/* ------------------------------------------------------------------ */
-/* Funkcje pomocnicze                                                  */
-/* ------------------------------------------------------------------ */
 
 /* Prosta funkcja haszująca FNV-1a: miesza bajty klucza w liczbę 32-bitową. */
 static uint32_t fnv1a(const void *data, size_t len, uint32_t h)
@@ -48,22 +38,12 @@ static uint32_t hash_endpoint(const ip_addr_t *a, uint16_t port)
     return fnv1a(&port, sizeof port, hash_addr(a));
 }
 
-/*
- * Hash przepływu musi być SYMETRYCZNY: pakiet A->B i odpowiedź B->A muszą
- * trafić do tego samego kubełka. Dlatego łączymy hashe obu końców
- * operacją XOR, która jest przemienna (x ^ y == y ^ x).
- */
 static uint32_t hash_flow(uint8_t proto, const ip_addr_t *a, uint16_t pa,
                           const ip_addr_t *b, uint16_t pb)
 {
     return (hash_endpoint(a, pa) ^ hash_endpoint(b, pb)) + proto;
 }
 
-/*
- * Generyczne dopisanie wskaźnika do tablicy dynamicznej.
- * 'void ***arr' to wskaźnik na zmienną typu 'void **' - musimy go przekazać,
- * bo realloc może przenieść tablicę w inne miejsce pamięci.
- */
 static int push_ptr(void ***arr, size_t *n, size_t *cap, void *item)
 {
     if (*n == *cap) {
@@ -78,9 +58,6 @@ static int push_ptr(void ***arr, size_t *n, size_t *cap, void *item)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Tworzenie i zwalnianie                                              */
-/* ------------------------------------------------------------------ */
 
 stats_t *stats_create(void)
 {
@@ -118,12 +95,14 @@ void stats_free(stats_t *s)
     free(s->tcp_port_pkts);
     free(s->udp_port_pkts);
     free(s->timeline);
+    for (size_t i = 0; i < s->n_tx; i++) {
+        free(s->tx[i].n);
+        free(s->tx[i].sum);
+        free(s->tx[i].sum2);
+    }
     free(s);
 }
 
-/* ------------------------------------------------------------------ */
-/* Liczniki ogólne, oś czasu, histogram                                */
-/* ------------------------------------------------------------------ */
 
 double stats_duration(const stats_t *s)
 {
@@ -155,45 +134,31 @@ static int size_bin(uint32_t len)
 }
 
 /* Dodaje pakiet do osi czasu. Indeks = numer sekundy od początku pliku. */
-static int timeline_add(stats_t *s, const packet_t *p, int proto_idx)
+/* Zwraca element osi czasu dla chwili ts (powiększa tablicę, gdy trzeba). */
+static tl_bucket_t *tl_slot(stats_t *s, double ts)
 {
-    double rel = p->ts - s->first_ts;
-    size_t idx = (rel > 0) ? (size_t)rel : 0;   /* rzutowanie double -> size_t obcina ułamek */
+    double rel = ts - s->first_ts;
+    size_t idx = (rel > 0) ? (size_t)rel : 0;
     if (idx >= TL_MAX_SECONDS)
         idx = TL_MAX_SECONDS - 1;
 
-    if (idx >= s->tl_cap) {                     /* trzeba powiększyć tablicę */
+    if (idx >= s->tl_cap) {
         size_t new_cap = s->tl_cap ? s->tl_cap : 64;
         while (new_cap <= idx)
             new_cap *= 2;
         tl_bucket_t *tmp = realloc(s->timeline, new_cap * sizeof *tmp);
         if (tmp == NULL)
-            return -1;
-        /* realloc nie zeruje nowej pamięci - robimy to sami */
-        memset(tmp + s->tl_cap, 0, (new_cap - s->tl_cap) * sizeof *tmp);
+            return NULL;
+        memset(tmp + s->tl_cap, 0, (new_cap - s->tl_cap) * sizeof *tmp);   /* realloc nie zeruje */
         s->timeline = tmp;
         s->tl_cap = new_cap;
     }
     if (idx + 1 > s->tl_len)
         s->tl_len = idx + 1;
-
-    s->timeline[idx].pkts[proto_idx]++;
-    s->timeline[idx].bytes[proto_idx] += p->wire_len;
-    return 0;
+    return &s->timeline[idx];
 }
 
-/* ------------------------------------------------------------------ */
-/* Hosty                                                               */
-/* ------------------------------------------------------------------ */
 
-/*
- * OPTYMALIZACJA: tablica haszująca, która rośnie.
- * Przy stałej liczbie kubełków (np. 4096) i milionie hostów każda lista
- * miałaby setki elementów, a wyszukiwanie byłoby bardzo wolne. Dlatego gdy
- * elementów jest więcej niż kubełków, podwajamy tablicę i rozkładamy
- * elementy na nowo ("rehash"). Średnia długość listy zostaje <= 1.
- * Każdy element pamięta swój hash, więc nie trzeba go liczyć ponownie.
- */
 static int host_hash_grow(stats_t *s)
 {
     size_t new_size = s->host_hash_size * 2;
@@ -255,20 +220,7 @@ static host_t *host_get(stats_t *s, const ip_addr_t *a)
     return h;
 }
 
-/* ------------------------------------------------------------------ */
-/* Przepływy                                                           */
-/* ------------------------------------------------------------------ */
 
-/*
- * Decyduje, czy nadawca PIERWSZEGO pakietu przepływu jest klientem.
- * Reguły (heurystyka):
- *   - TCP SYN bez ACK  -> nadawca to klient (otwiera połączenie),
- *   - TCP SYN+ACK      -> nadawca to serwer (odpowiada),
- *   - jeśli tylko jedna strona ma port < 1024 ("dobrze znany"), to ona jest serwerem,
- *   - UDP: klientem jest nadawca pierwszego pakietu,
- *   - TCP bez SYN (nagranie zaczęło się w trakcie połączenia): klientem jest
- *     strona z wyższym portem.
- */
 static int sender_is_client(const packet_t *p)
 {
     if (p->proto == PROTO_TCP && (p->tcp_flags & TCP_SYN))
@@ -282,10 +234,6 @@ static int sender_is_client(const packet_t *p)
     return p->sport >= p->dport;
 }
 
-/*
- * Szuka przepływu pasującego do pakietu (w dowolnym kierunku).
- * Jeśli nie istnieje - tworzy nowy. W *dir zwraca kierunek pakietu.
- */
 static flow_t *flow_get(stats_t *s, const packet_t *p, int *dir)
 {
     uint32_t hash = hash_flow(p->proto, &p->src, p->sport, &p->dst, p->dport);
@@ -336,16 +284,6 @@ static flow_t *flow_get(stats_t *s, const packet_t *p, int *dir)
     return f;
 }
 
-/*
- * Analiza TCP w ramach przepływu: etapy handshake, RTT i retransmisje.
- *
- * Retransmisja (uproszczona metoda): każdy bajt danych TCP ma numer
- * sekwencyjny. Pamiętamy najwyższy "koniec" danych (next_seq) wysłanych
- * w danym kierunku. Jeśli przychodzi segment z danymi, którego koniec
- * NIE wychodzi poza next_seq, to te dane już widzieliśmy -> retransmisja.
- * (Pakiety, które przyszły w złej kolejności, też zostaną tak policzone -
- * to świadome uproszczenie.)
- */
 static void flow_tcp_update(stats_t *s, flow_t *f, const packet_t *p, int dir)
 {
     uint8_t fl = p->tcp_flags;
@@ -365,8 +303,19 @@ static void flow_tcp_update(stats_t *s, flow_t *f, const packet_t *p, int dir)
         f->handshake |= HS_ACK;
     }
 
-    /* --- retransmisje --- */
-    /* SYN i FIN "zajmują" jeden numer sekwencyjny, tak jak 1 bajt danych. */
+    /* RTT: czas od danych do ACK z drugiej strony */
+    int o = 1 - dir;
+    if ((fl & TCP_ACK) && f->ack_pending[o] && (int32_t)(p->ack - f->ack_wait[o]) >= 0) {
+        tl_bucket_t *b = tl_slot(s, p->ts);
+        if (b) {
+            b->rtt_n++;
+            b->rtt_sum += (float)(p->ts - f->ack_ts[o]);
+        }
+        f->ack_pending[o] = 0;
+    }
+
+    /* Retransmisje: koniec segmentu nie wychodzi poza next_seq = dane już były.
+     * SYN i FIN zajmują 1 numer sekwencyjny. */
     uint32_t seg_len = p->payload_len + ((fl & TCP_SYN) ? 1 : 0) + ((fl & TCP_FIN) ? 1 : 0);
     if (seg_len == 0 || (fl & TCP_RST))
         return;                              /* czyste ACK / RST nie niosą danych */
@@ -377,20 +326,24 @@ static void flow_tcp_update(stats_t *s, flow_t *f, const packet_t *p, int dir)
         f->seq_valid[dir] = 1;
         return;
     }
-    /* Rzutowanie różnicy na int32_t poprawnie obsługuje "zawinięcie"
-     * licznika sekwencyjnego po przekroczeniu 2^32. */
-    int32_t diff = (int32_t)(seg_end - f->next_seq[dir]);
+    int32_t diff = (int32_t)(seg_end - f->next_seq[dir]);   /* int32: zawinięcie licznika */
     if (diff <= 0) {
         f->retrans++;
         s->tcp_retrans++;
+        f->ack_pending[dir] = 0;             /* algorytm Karna: bez RTT z retransmisji */
+        tl_bucket_t *b = tl_slot(s, p->ts);
+        if (b)
+            b->retrans++;
     } else {
         f->next_seq[dir] = seg_end;
+        if (p->payload_len > 0 && !f->ack_pending[dir]) {
+            f->ack_pending[dir] = 1;
+            f->ack_wait[dir] = seg_end;
+            f->ack_ts[dir] = p->ts;
+        }
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Główne funkcje                                                      */
-/* ------------------------------------------------------------------ */
 
 void stats_add_other(stats_t *s, const packet_t *p, int bad)
 {
@@ -401,6 +354,80 @@ void stats_add_other(stats_t *s, const packet_t *p, int bad)
         s->other_pkts++;
         s->other_bytes += p->wire_len;
     }
+    tl_bucket_t *b = tl_slot(s, p->ts);
+    if (b)
+        b->other++;
+}
+
+static radio_tx_t *tx_get(stats_t *s, const uint8_t *mac)
+{
+    for (size_t i = 0; i < s->n_tx; i++)
+        if (memcmp(s->tx[i].mac, mac, 6) == 0)
+            return &s->tx[i];
+    if (s->n_tx == MAX_TX)
+        return NULL;                         /* za dużo nadajników - pomijamy resztę */
+    radio_tx_t *t = &s->tx[s->n_tx++];
+    memcpy(t->mac, mac, 6);
+    return t;
+}
+
+/* Powiększa tablice sekundowe nadajnika do co najmniej 'need' elementów. */
+static int tx_grow(radio_tx_t *t, size_t need)
+{
+    if (need <= t->cap)
+        return 0;
+    size_t cap = t->cap ? t->cap : 64;
+    while (cap < need)
+        cap *= 2;
+    uint32_t *n = realloc(t->n, cap * sizeof *n);
+    if (n == NULL) return -1;
+    t->n = n;
+    double *a = realloc(t->sum, cap * sizeof *a);
+    if (a == NULL) return -1;
+    t->sum = a;
+    double *b = realloc(t->sum2, cap * sizeof *b);
+    if (b == NULL) return -1;
+    t->sum2 = b;
+    memset(t->n + t->cap, 0, (cap - t->cap) * sizeof *n);
+    memset(t->sum + t->cap, 0, (cap - t->cap) * sizeof *a);
+    memset(t->sum2 + t->cap, 0, (cap - t->cap) * sizeof *b);
+    t->cap = cap;
+    return 0;
+}
+
+int stats_add_radio(stats_t *s, const packet_t *p)
+{
+    tl_bucket_t *b = tl_slot(s, p->ts);
+    if (b == NULL)
+        return -1;
+    size_t sec = (size_t)(b - s->timeline);
+
+    s->wifi_frames++;
+    b->wifi++;
+    if (p->retry) {
+        s->wifi_retry++;
+        b->wifi_retry++;
+    }
+    if (p->has_noise) {
+        b->noise_n++;
+        b->noise_sum += p->noise;
+    }
+    if (s->freq == 0)
+        s->freq = p->freq;
+
+    if (p->has_rssi && p->has_tx) {
+        radio_tx_t *t = tx_get(s, p->tx_mac);
+        if (t == NULL)
+            return 0;
+        if (tx_grow(t, sec + 1) != 0)
+            return -1;
+        t->frames++;
+        t->rssi_sum += p->rssi;
+        t->n[sec]++;
+        t->sum[sec]  += p->rssi;
+        t->sum2[sec] += (double)p->rssi * p->rssi;
+    }
+    return 0;
 }
 
 int stats_add_packet(stats_t *s, const packet_t *p)
@@ -444,8 +471,11 @@ int stats_add_packet(stats_t *s, const packet_t *p)
         s->udp_bytes += p->wire_len;
     }
 
-    if (timeline_add(s, p, proto_idx) != 0)
+    tl_bucket_t *b = tl_slot(s, p->ts);
+    if (b == NULL)
         return -1;
+    b->pkts[proto_idx]++;
+    b->bytes[proto_idx] += p->wire_len;
 
     /* Hosty: nadawca i odbiorca. */
     host_t *hs = host_get(s, &p->src);

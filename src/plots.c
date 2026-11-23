@@ -1,6 +1,4 @@
-/*
- * plots.c - zamiana statystyk na dane do wykresów (opis w plots.h).
- */
+/* plots.c - wykresy raportu: dane radiowe, łącze i podstawowe statystyki TCP/UDP. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,10 +15,9 @@ size_t top_n(const double *values, size_t count, size_t *idx, size_t n_top)
         double v = values[i];
         if (v <= 0)
             continue;
-        /* Czy wartość mieści się w obecnym "top"? */
         if (used == n_top && v <= values[idx[used - 1]])
             continue;
-        /* Sortowanie przez wstawianie: przesuwamy mniejsze elementy w prawo. */
+        /* sortowanie przez wstawianie */
         size_t pos = (used < n_top) ? used++ : used - 1;
         while (pos > 0 && values[idx[pos - 1]] < v) {
             idx[pos] = idx[pos - 1];
@@ -31,139 +28,138 @@ size_t top_n(const double *values, size_t count, size_t *idx, size_t n_top)
     return used;
 }
 
-/* ------------------------------------------------------------------ */
-/* Oś czasu                                                            */
-/* ------------------------------------------------------------------ */
+#define MAX_POINTS 600   /* więcej punktów niż pikseli nie ma sensu */
 
-/* Dane osi czasu po zgrupowaniu sekund w przedziały. */
-typedef struct {
-    double *tcp, *udp;   /* wartości na sekundę w każdym przedziale */
-    size_t  n;           /* liczba punktów */
-    size_t  width;       /* ile sekund ma jeden punkt */
-} series_t;
-
-/* bytes = 0 -> pakiety/s, bytes = 1 -> kbit/s */
-static int build_series(const stats_t *s, int bytes, series_t *out)
+/* Uśrednia serię sekundową do <= MAX_POINTS punktów (pomija NAN). */
+static double *resample(const double *v, size_t n, size_t *n_out, size_t *width)
 {
-    /* Za dużo punktów byłoby nieczytelne - grupujemy sekundy w przedziały. */
-    const size_t MAX_POINTS = 200;
-    size_t width = (s->tl_len + MAX_POINTS - 1) / MAX_POINTS;   /* dzielenie z zaokrągleniem w górę */
-    if (width == 0) width = 1;
-    size_t n = (s->tl_len + width - 1) / width;
-
-    out->tcp = calloc(n ? n : 1, sizeof(double));
-    out->udp = calloc(n ? n : 1, sizeof(double));
-    out->n = n;
-    out->width = width;
-    if (!out->tcp || !out->udp) {
-        free(out->tcp);
-        free(out->udp);
-        return -1;
+    size_t w = (n + MAX_POINTS - 1) / MAX_POINTS;
+    if (w == 0) w = 1;
+    size_t m = (n + w - 1) / w;
+    double *out = malloc((m ? m : 1) * sizeof *out);
+    if (out == NULL)
+        return NULL;
+    for (size_t k = 0; k < m; k++) {
+        double sum = 0;
+        int cnt = 0;
+        for (size_t i = k * w; i < (k + 1) * w && i < n; i++)
+            if (!isnan(v[i])) { sum += v[i]; cnt++; }
+        out[k] = cnt ? sum / cnt : NAN;
     }
-    for (size_t i = 0; i < s->tl_len; i++) {
-        size_t k = i / width;
-        if (bytes) {
-            out->tcp[k] += (double)s->timeline[i].bytes[0];
-            out->udp[k] += (double)s->timeline[i].bytes[1];
-        } else {
-            out->tcp[k] += s->timeline[i].pkts[0];
-            out->udp[k] += s->timeline[i].pkts[1];
-        }
-    }
-    double scale = bytes ? 8.0 / 1000.0 / width : 1.0 / width;   /* bajty -> kilobity */
-    for (size_t k = 0; k < n; k++) {
-        out->tcp[k] *= scale;
-        out->udp[k] *= scale;
-    }
-    return 0;
+    *n_out = m;
+    *width = w;
+    return out;
 }
 
-/* Okna czasowe incydentów (ostrzeżenia i krytyczne) jako pasy na wykresie. */
-static size_t build_bands(const stats_t *s, const anomalies_t *a, chart_band_t *bands, size_t max)
+/* Pasy z wykrytych zdarzeń; 'mask' wybiera typy (bit 1 << EV_...). */
+static size_t build_bands(const sensing_t *x, unsigned mask, chart_band_t *b, size_t max)
 {
+    static const char *short_name[EV_COUNT] = {
+        "ruch", "zakłócenia", "opóźnienie", "retransmisje", "przerwa"
+    };
     size_t n = 0;
-    double dur = stats_duration(s);
-    for (size_t i = 0; a && i < a->n && n < max; i++) {
-        const anomaly_t *an = &a->items[i];
-        if (an->severity == SEV_INFO || an->t_start <= 0)
+    for (size_t i = 0; i < x->n_ev && n < max; i++) {
+        const event_t *e = &x->ev[i];
+        if (!(mask & (1u << e->type)))
             continue;
-        /* pomijamy "incydenty" obejmujące prawie całe nagranie - pas nic by nie mówił */
-        if (dur > 0 && an->t_end - an->t_start > 0.8 * dur)
-            continue;
-        bands[n].x0 = an->t_start - s->first_ts;
-        bands[n].x1 = an->t_end - s->first_ts;
-        bands[n].critical = an->severity == SEV_CRIT;
-        bands[n].label = an->category;
+        b[n].x0 = e->t0;
+        b[n].x1 = e->t1;
+        b[n].kind = (e->type == EV_MOTION) ? BAND_MOTION
+                  : (e->type == EV_INTERFERENCE) ? BAND_WARN : BAND_CRIT;
+        b[n].label = short_name[e->type];
         n++;
-    }
-    /* sortujemy pasy wg czasu (sortowanie przez wstawianie - pasów jest mało),
-     * żeby wykres mógł pominąć nachodzące na siebie podpisy */
-    for (size_t i = 1; i < n; i++) {
-        chart_band_t tmp = bands[i];
-        size_t j = i;
-        while (j > 0 && bands[j - 1].x0 > tmp.x0) {
-            bands[j] = bands[j - 1];
-            j--;
-        }
-        bands[j] = tmp;
     }
     return n;
 }
 
-int plot_timeline_packets(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
-{
-    series_t sr;
-    if (build_series(s, 0, &sr) != 0)
-        return -1;
-    chart_band_t bands[16];
-    size_t nb = build_bands(s, a, bands, 16);
+#define M_MOTION (1u << EV_MOTION)
+#define M_RADIO  (1u << EV_INTERFERENCE)
+#define M_LINK   ((1u << EV_DELAY) | (1u << EV_RETRANS) | (1u << EV_GAP))
+#define M_ALL    (M_MOTION | M_RADIO | M_LINK)
 
-    char sub[128];
-    snprintf(sub, sizeof sub, "Pakiety na sekundę (punkt co %zu s); pasy = okna wykrytych incydentów",
-             sr.width);
-    /* Tablica wskaźników na tablice - tak przekazujemy kilka serii naraz. */
-    const double *ser[2] = { sr.tcp, sr.udp };
-    const char *names[2] = { "TCP", "UDP" };
-    int rc = chart_lines(cr, path, "Natężenie ruchu i incydenty w czasie", sub,
-                         ser, names, 2, sr.n, (double)sr.width, "pakiety / s", bands, nb);
-    free(sr.tcp);
-    free(sr.udp);
+/* Wspólny kod wykresu jednej serii sekundowej z pasami zdarzeń. */
+static int one_series(const analysis_t *an, cairo_t *cr, const char *path,
+                      const double *v, const char *name, const char *title,
+                      const char *sub, const char *y_title, unsigned mask,
+                      int y_from_data, double thr, const char *thr_label)
+{
+    size_t n, w;
+    double *r = resample(v, an->x->n_sec, &n, &w);
+    if (r == NULL)
+        return -1;
+    chart_band_t bands[64];
+    line_chart_t c = {
+        .title = title, .subtitle = sub, .y_title = y_title,
+        .series = (const double *const[]){ r }, .names = (const char *const[]){ name },
+        .n_series = 1, .n_points = n, .x_step = (double)w,
+        .bands = bands, .n_bands = build_bands(an->x, mask, bands, 64),
+        .y_from_data = y_from_data, .threshold = thr, .threshold_label = thr_label,
+    };
+    int rc = chart_lines(cr, path, &c);
+    free(r);
     return rc;
 }
 
-static int plot_timeline_bytes(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
+static int plot_rssi(const analysis_t *an, cairo_t *cr, const char *path)
 {
-    (void)a;   /* parametr nieużywany - rzutowanie na void ucisza ostrzeżenie kompilatora */
-    series_t sr;
-    if (build_series(s, 1, &sr) != 0)
-        return -1;
-    char sub[96];
-    snprintf(sub, sizeof sub, "Kilobity na sekundę (punkt co %zu s)", sr.width);
-    const double *ser[2] = { sr.tcp, sr.udp };
-    const char *names[2] = { "TCP", "UDP" };
-    int rc = chart_lines(cr, path, "Przepustowość w czasie", sub,
-                         ser, names, 2, sr.n, (double)sr.width, "kbit / s", NULL, 0);
-    free(sr.tcp);
-    free(sr.udp);
-    return rc;
+    char sub[96] = "Brak danych radiowych (plik bez nagłówków radiotap)";
+    if (an->x->ref_tx >= 0) {
+        char mac[18];
+        mac_to_str(an->s->tx[an->x->ref_tx].mac, mac);
+        snprintf(sub, sizeof sub, "Nadajnik %s; fioletowe pasy = podejrzenie ruchu", mac);
+    }
+    return one_series(an, cr, path, an->x->rssi, "RSSI", "Siła sygnału Wi-Fi i ruch",
+                      sub, "dBm", M_MOTION, 1, NAN, NULL);
 }
 
-/* ------------------------------------------------------------------ */
-/* Wykresy słupkowe                                                    */
-/* ------------------------------------------------------------------ */
-
-static int plot_protocols(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
+static int plot_motion(const analysis_t *an, cairo_t *cr, const char *path)
 {
-    (void)a;
-    const char *labels[] = { "TCP", "UDP", "Inne (ARP, ICMP...)" };
-    double values[] = { (double)s->tcp_pkts, (double)s->udp_pkts, (double)s->other_pkts };
-    return chart_vbar(cr, path, "Pakiety według protokołu", "Liczba pakietów",
-                      labels, values, 3, NULL, "pakiety");
+    char thr[48];
+    snprintf(thr, sizeof thr, "próg %.1f dB", an->x->motion_thr);
+    return one_series(an, cr, path, an->x->motion, "wskaźnik ruchu",
+                      "Wskaźnik ruchu", "Odchylenie standardowe RSSI w oknie 3 s",
+                      "dB", M_MOTION, 0, an->x->ref_tx >= 0 ? an->x->motion_thr : NAN, thr);
 }
 
-static int plot_top_hosts(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
+static int plot_retry(const analysis_t *an, cairo_t *cr, const char *path)
 {
-    (void)a;
+    return one_series(an, cr, path, an->x->retry, "powtórzone ramki",
+                      "Zakłócenia radiowe: powtórzenia ramek",
+                      "Odsetek ramek z flagą Retry", "%", M_RADIO, 0, 25, "próg 25%");
+}
+
+static int plot_noise(const analysis_t *an, cairo_t *cr, const char *path)
+{
+    return one_series(an, cr, path, an->x->noise, "szum", "Poziom szumu",
+                      "Szum tła zgłaszany przez kartę Wi-Fi", "dBm", M_RADIO, 1, NAN, NULL);
+}
+
+static int plot_pps(const analysis_t *an, cairo_t *cr, const char *path)
+{
+    return one_series(an, cr, path, an->x->pps, "TCP+UDP", "Ruch w sieci i wszystkie zdarzenia",
+                      "Pakiety na sekundę", "pakiety / s", M_ALL, 0, NAN, NULL);
+}
+
+static int plot_rtt(const analysis_t *an, cairo_t *cr, const char *path)
+{
+    char thr[48];
+    snprintf(thr, sizeof thr, "próg %.0f ms", an->x->rtt_thr);
+    return one_series(an, cr, path, an->x->rtt, "RTT", "Opóźnienie TCP (RTT)",
+                      "Czas od wysłania danych do potwierdzenia ACK", "ms",
+                      (1u << EV_DELAY) | (1u << EV_GAP), 0,
+                      an->x->rtt_thr > 0 ? an->x->rtt_thr : NAN, thr);
+}
+
+static int plot_retrans(const analysis_t *an, cairo_t *cr, const char *path)
+{
+    return one_series(an, cr, path, an->x->retrans, "retransmisje",
+                      "Retransmisje TCP", "Powtórzone segmenty na sekundę", "na sekundę",
+                      (1u << EV_RETRANS), 0, NAN, NULL);
+}
+
+static int plot_top_hosts(const analysis_t *an, cairo_t *cr, const char *path)
+{
+    const stats_t *s = an->s;
     double *vals = malloc((s->n_hosts ? s->n_hosts : 1) * sizeof(double));
     if (vals == NULL)
         return -1;
@@ -172,7 +168,7 @@ static int plot_top_hosts(const stats_t *s, const anomalies_t *a, cairo_t *cr, c
 
     size_t idx[10];
     size_t n = top_n(vals, s->n_hosts, idx, 10);
-    char names[10][ADDR_STR_LEN];        /* tablica dwuwymiarowa: 10 napisów */
+    char names[10][ADDR_STR_LEN];
     const char *labels[10];
     double values[10];
     for (size_t i = 0; i < n; i++) {
@@ -185,10 +181,10 @@ static int plot_top_hosts(const stats_t *s, const anomalies_t *a, cairo_t *cr, c
                       labels, values, n, "B");
 }
 
-static int plot_top_services(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
+static int plot_top_services(const analysis_t *an, cairo_t *cr, const char *path)
 {
-    (void)a;
-    /* Łączymy porty TCP (indeksy 0..65535) i UDP (65536..131071) w jedną tablicę. */
+    const stats_t *s = an->s;
+    /* porty TCP: indeksy 0..65535, UDP: 65536..131071 */
     double *vals = malloc(2 * 65536 * sizeof(double));
     if (vals == NULL)
         return -1;
@@ -211,34 +207,13 @@ static int plot_top_services(const stats_t *s, const anomalies_t *a, cairo_t *cr
         values[i] = vals[idx[i]];
     }
     free(vals);
-    return chart_hbar(cr, path, "Najpopularniejsze usługi (porty serwerów)",
+    return chart_hbar(cr, path, "Usługi (porty serwerów)",
                       "Liczba pakietów, top 10", labels, values, n, "pakietów");
 }
 
-static int plot_sizes(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
+static int plot_flow_states(const analysis_t *an, cairo_t *cr, const char *path)
 {
-    (void)a;
-    double values[SIZE_BINS];
-    for (int i = 0; i < SIZE_BINS; i++)
-        values[i] = (double)s->size_hist[i];
-    return chart_vbar(cr, path, "Rozkład rozmiarów pakietów", "Pakiety TCP i UDP",
-                      SIZE_BIN_LABELS, values, SIZE_BINS, "rozmiar pakietu [bajty]", "pakiety");
-}
-
-static int plot_flags(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
-{
-    (void)a;
-    const char *labels[] = { "SYN", "SYN+ACK", "FIN", "RST", "PSH", "sam ACK" };
-    double values[] = { (double)s->f_syn, (double)s->f_synack, (double)s->f_fin,
-                        (double)s->f_rst, (double)s->f_psh, (double)s->f_ack_only };
-    return chart_vbar(cr, path, "Flagi TCP", "Liczba pakietów z daną flagą",
-                      labels, values, 6, NULL, "pakiety");
-}
-
-static int plot_flow_states(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
-{
-    (void)a;
-    /* Liczymy przepływy TCP w każdym stanie - indeksem tablicy jest wartość enum. */
+    const stats_t *s = an->s;
     double counts[FS_COUNT] = { 0 };
     for (size_t i = 0; i < s->n_flows; i++)
         if (s->flows[i]->proto == PROTO_TCP)
@@ -256,85 +231,28 @@ static int plot_flow_states(const stats_t *s, const anomalies_t *a, cairo_t *cr,
                       labels, values, n, "połączeń");
 }
 
-static int plot_rtt(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
-{
-    (void)a;
-    const char *labels[] = { "<1 ms", "1-10 ms", "10-50 ms", "50-100 ms", "100-500 ms", ">500 ms" };
-    const double limits[] = { 0.001, 0.010, 0.050, 0.100, 0.500 };
-    double values[6] = { 0 };
-    size_t n_rtt = 0;
-    for (size_t i = 0; i < s->n_flows; i++) {
-        double r = s->flows[i]->rtt;
-        if (r < 0)
-            continue;
-        int b = 0;
-        while (b < 5 && r >= limits[b])
-            b++;
-        values[b]++;
-        n_rtt++;
-    }
-    char sub[96];
-    snprintf(sub, sizeof sub, "Czas SYN -> SYN+ACK, %zu połączeń", n_rtt);
-    return chart_vbar(cr, path, "Czas nawiązania połączenia (RTT)", sub,
-                      labels, values, 6, "czas odpowiedzi serwera", "połączenia");
-}
-
-static int plot_fanout(const stats_t *s, const anomalies_t *a, cairo_t *cr, const char *path)
-{
-    (void)s;
-    size_t n = a->n_fanout < 10 ? a->n_fanout : 10;
-    char names[10][ADDR_STR_LEN];
-    const char *labels[10];
-    double values[10];
-    for (size_t i = 0; i < n; i++) {
-        addr_to_str(&a->fanout[i].addr, names[i]);
-        labels[i] = names[i];
-        values[i] = a->fanout[i].targets;
-    }
-    return chart_hbar(cr, path, "Hosty kontaktujące najwięcej celów",
-                      "Liczba różnych par (host, port) docelowych, top 10",
-                      labels, values, n, "celów");
-}
-
-/* ------------------------------------------------------------------ */
-/* Lista wykresów - kolejność = kolejność w raporcie                    */
-/* ------------------------------------------------------------------ */
-
 const plot_def_t PLOTS[] = {
-    { "01_ruch_incydenty.png", "Jak czytać: linie pokazują liczbę pakietów na sekundę, a kolorowe "
-      "pasy okna czasowe wykrytych incydentów (czerwone - krytyczne, pomarańczowe - ostrzeżenia). "
-      "Nagły wzrost w pasie to zwykle sam atak.", plot_timeline_packets },
-    { "02_przepustowosc.png", "Jak czytać: ile danych płynęło w każdej chwili. Ataki typu flood "
-      "często mają dużo pakietów, ale mało danych - porównaj z wykresem powyżej.",
-      plot_timeline_bytes },
-    { "03_protokoly.png", "Podział pakietów na TCP, UDP i pozostałe (np. ARP). Nagła przewaga UDP "
-      "w sieci, gdzie zwykle dominuje TCP, jest podejrzana.", plot_protocols },
-    { "04_top_hosty.png", "Hosty, które wymieniły najwięcej danych. Nieznany adres na szczycie "
-      "listy warto sprawdzić.", plot_top_hosts },
-    { "05_top_uslugi.png", "Porty po stronie serwera, przez które przeszło najwięcej pakietów - "
-      "czyli z jakich usług najczęściej korzystano.", plot_top_services },
-    { "06_rozmiary_pakietow.png", "Dużo małych pakietów to sterowanie (ACK, SYN) lub atak flood; "
-      "duże pakiety to transfer danych.", plot_sizes },
-    { "07_flagi_tcp.png", "Zdrowy ruch ma podobną liczbę SYN i SYN+ACK. Duża przewaga SYN lub "
-      "dużo RST wskazuje na skanowanie albo SYN flood.", plot_flags },
-    { "08_stany_polaczen.png", "Jak kończyły się połączenia TCP. Większość powinna być "
-      "nawiązana i zamknięta FIN; dużo połączeń bez odpowiedzi to obraz ataku.",
-      plot_flow_states },
-    { "09_rtt.png", "Czas odpowiedzi serwerów na SYN. Długie czasy oznaczają odległe lub "
-      "przeciążone serwery.", plot_rtt },
-    { "10_rozne_cele.png", "Host łączący się z bardzo wieloma różnymi portami lub hostami to "
-      "najczęściej skaner.", plot_fanout },
-    { NULL, NULL, NULL }    /* "wartownik" - oznacza koniec tablicy */
+    { "01_rssi_ruch.png", "Gdy ktoś się porusza, RSSI zaczyna skakać - te okresy są zaznaczone.", plot_rssi },
+    { "02_wskaznik_ruchu.png", "Powyżej linii progu uznajemy, że w pomieszczeniu był ruch.", plot_motion },
+    { "03_powtorzenia.png", "Dużo powtórzonych ramek = zakłócenia lub kolizje w kanale.", plot_retry },
+    { "04_szum.png", "Wzrost szumu oznacza obce źródło sygnału na tym kanale.", plot_noise },
+    { "05_ruch_sieciowy.png", "Natężenie ruchu na tle wszystkich wykrytych zdarzeń.", plot_pps },
+    { "06_rtt.png", "Skoki ponad próg to chwilowe problemy z łączem.", plot_rtt },
+    { "07_retransmisje.png", "Retransmisje pojawiają się, gdy pakiety giną po drodze.", plot_retrans },
+    { "08_uslugi.png", "Najczęściej używane usługi.", plot_top_services },
+    { "09_hosty.png", "Hosty, które wymieniły najwięcej danych.", plot_top_hosts },
+    { "10_stany_tcp.png", "Jak kończyły się połączenia TCP.", plot_flow_states },
+    { NULL, NULL, NULL }
 };
 
-int plots_generate(const stats_t *s, const anomalies_t *a, const char *outdir, int *n_ok)
+int plots_generate(const analysis_t *an, const char *outdir, int *n_ok)
 {
     int errors = 0;
     *n_ok = 0;
     for (const plot_def_t *p = PLOTS; p->file != NULL; p++) {
         char path[512];
         snprintf(path, sizeof path, "%s/%s", outdir, p->file);
-        if (p->draw(s, a, NULL, path) == 0) (*n_ok)++;
+        if (p->draw(an, NULL, path) == 0) (*n_ok)++;
         else errors++;
     }
     return errors;

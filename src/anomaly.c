@@ -1,12 +1,5 @@
-/*
- * anomaly.c - detektory nieprawidłowości (opis w anomaly.h).
- *
- * Główna technika: z tabeli przepływów budujemy tablicę prostych rekordów
- * "próba połączenia" (attempt_t), sortujemy ją funkcją qsort według
- * odpowiedniego klucza i przechodzimy po GRUPACH sąsiednich rekordów
- * o tym samym kluczu. Po posortowaniu np. wszystkie próby z hosta A do
- * hosta B leżą obok siebie - łatwo je policzyć bez dodatkowych struktur.
- */
+/* anomaly.c - wykrywanie ataków (dodatek): skanowanie portów i sieci, SYN flood,
+ * UDP flood, połączenia zrywane RST, nietypowe flagi TCP. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,10 +12,8 @@ void thresholds_default(thresholds_t *t)
     t->scan_min_ports  = 15;
     t->sweep_min_hosts = 15;
     t->synflood_min    = 100;
-    t->retrans_ratio   = 0.03;
     t->rst_ratio       = 0.30;
     t->udpflood_pps    = 500.0;
-    t->spike_sigma     = 4.0;
 }
 
 const char *severity_name(severity_t s)
@@ -33,24 +24,6 @@ const char *severity_name(severity_t s)
     default:       return "INFO";
     }
 }
-
-int risk_level(int score)
-{
-    if (score >= 70) return 3;
-    if (score >= 40) return 2;
-    if (score >= 15) return 1;
-    return 0;
-}
-
-const char *risk_level_name(int level)
-{
-    static const char *names[] = { "NISKIE", "PODWYŻSZONE", "WYSOKIE", "KRYTYCZNE" };
-    return names[level < 0 ? 0 : level > 3 ? 3 : level];
-}
-
-/* ------------------------------------------------------------------ */
-/* Rekomendacje - stałe napisy (przechowywane w pamięci tylko do odczytu) */
-/* ------------------------------------------------------------------ */
 
 static const char *ADV_PORTSCAN =
     "Zablokuj adres źródłowy na zaporze (firewall). Sprawdź, czy wykryte otwarte porty "
@@ -72,30 +45,13 @@ static const char *ADV_UDPFLOOD =
     "Ogranicz ruch UDP do atakowanego hosta na brzegu sieci (rate limiting), "
     "zablokuj nadawców i nieużywane porty UDP. Przy trwającym ataku skontaktuj się "
     "z dostawcą Internetu.";
-static const char *ADV_RETRANS =
-    "Sprawdź obciążenie łącza i błędy na interfejsach (ip -s link), jakość Wi-Fi "
-    "i okablowania oraz ustawienia MTU. Wskazane połączenie to dobry punkt startowy.";
-static const char *ADV_RETRANS_OK = "Brak działań - poziom retransmisji jest w normie.";
 static const char *ADV_RST =
     "Sprawdź, czy usługi docelowe działają i czy zapora nie odrzuca połączeń. "
     "Jeśli RST są skutkiem skanowania, zobacz incydenty skanowania.";
 static const char *ADV_FLAGS =
     "Zablokuj nadawcę. Zapora śledząca stan połączeń (stateful firewall) odrzuca "
     "takie pakiety automatycznie - upewnij się, że jest włączona.";
-static const char *ADV_SPIKE =
-    "Sprawdź, co działo się we wskazanym czasie (filtr frame.time w Wiresharku). "
-    "Jeśli skoki się powtarzają, ustaw alarm na natężenie ruchu.";
 
-/* ------------------------------------------------------------------ */
-/* Dodawanie incydentu do listy                                        */
-/* ------------------------------------------------------------------ */
-
-/*
- * Funkcja ze zmienną liczbą argumentów (jak printf). "..." oznacza dowolne
- * dodatkowe argumenty; obsługuje się je makrami z <stdarg.h>.
- * Zwraca wskaźnik na nowy incydent (żeby wywołujący uzupełnił resztę pól)
- * albo NULL przy braku pamięci.
- */
 static anomaly_t *add_anomaly(anomalies_t *out, severity_t sev, const char *cat,
                               const char *advice, const char *fmt, ...)
 {
@@ -148,16 +104,6 @@ typedef struct {
     double    first, last;
 } attempt_t;
 
-/* ------------------------------------------------------------------ */
-/* Funkcje porównujące dla qsort                                       */
-/* ------------------------------------------------------------------ */
-/*
- * qsort(tablica, liczba, rozmiar_elementu, funkcja_porównująca) to
- * standardowe sortowanie z biblioteki C. Funkcję porównującą przekazujemy
- * jako WSKAŹNIK NA FUNKCJĘ. Dostaje ona dwa wskaźniki 'const void *'
- * (nieznanego typu), które sami rzutujemy na właściwy typ.
- */
-
 /* Sortowanie po (a, b, protokół, port). */
 static int cmp_a_b_port(const void *x, const void *y)
 {
@@ -207,10 +153,6 @@ static int flow_open(const flow_t *f)
         return (f->handshake & HS_SYNACK) != 0;
     return f->pkts[DIR_S2C] > 0;
 }
-
-/* ------------------------------------------------------------------ */
-/* Detektor 1+2: skanowanie portów i sieci, "fan-out" hostów            */
-/* ------------------------------------------------------------------ */
 
 static int detect_scans(const stats_t *s, const thresholds_t *t, anomalies_t *out)
 {
@@ -354,10 +296,6 @@ oom:   /* "goto" w C jest akceptowane do wspólnej obsługi błędów i sprząta
     return -1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Detektor 3: SYN flood                                               */
-/* ------------------------------------------------------------------ */
-
 static int cmp_double(const void *x, const void *y)
 {
     double a = *(const double *)x, b = *(const double *)y;
@@ -434,45 +372,10 @@ static int detect_synflood(const stats_t *s, const thresholds_t *t, anomalies_t 
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Detektor 4+5: retransmisje, RST, nietypowe flagi                     */
-/* ------------------------------------------------------------------ */
-
 static int detect_tcp_health(const stats_t *s, const thresholds_t *t, anomalies_t *out)
 {
     if (s->tcp_pkts == 0)
         return 0;
-
-    double ratio = (double)s->tcp_retrans / (double)s->tcp_pkts;
-    if (s->tcp_retrans >= 10 && ratio >= t->retrans_ratio) {
-        /* znajdź przepływ z największą liczbą retransmisji */
-        const flow_t *worst = NULL;
-        for (size_t i = 0; i < s->n_flows; i++)
-            if (worst == NULL || s->flows[i]->retrans > worst->retrans)
-                worst = s->flows[i];
-        char a[ADDR_STR_LEN];
-        addr_to_str(&worst->cli, a);
-        severity_t sev = ratio >= 3 * t->retrans_ratio ? SEV_CRIT : SEV_WARN;
-        anomaly_t *an = add_anomaly(out, sev, "Retransmisje TCP", ADV_RETRANS,
-                "%.1f%% pakietów TCP to retransmisje (%llu). Oznacza to utratę pakietów, "
-                "przeciążenie łącza lub problemy z siecią. Najwięcej retransmisji (%u) "
-                "było w połączeniu klienta %s:%u ze wskazanym celem.",
-                100.0 * ratio, (unsigned long long)s->tcp_retrans, worst->retrans,
-                a, worst->cport);
-        if (an == NULL)
-            return -1;
-        snprintf(an->source, sizeof an->source, "wiele połączeń");
-        set_dst(an, &worst->srv, worst->sport);
-        an->has_dst_ip = 0;            /* problem sieci, nie atak - nie na liście IOC */
-    } else if (s->tcp_retrans > 0) {
-        anomaly_t *an = add_anomaly(out, SEV_INFO, "Retransmisje TCP", ADV_RETRANS_OK,
-                "Wykryto %llu retransmisji (%.2f%% pakietów TCP) - poziom w normie.",
-                (unsigned long long)s->tcp_retrans, 100.0 * ratio);
-        if (an == NULL)
-            return -1;
-        snprintf(an->source, sizeof an->source, "-");
-        snprintf(an->target, sizeof an->target, "-");
-    }
 
     /* Odsetek połączeń zerwanych przez RST */
     uint64_t rst_flows = 0;
@@ -514,10 +417,6 @@ static int detect_tcp_health(const stats_t *s, const thresholds_t *t, anomalies_
     }
     return 0;
 }
-
-/* ------------------------------------------------------------------ */
-/* Detektor 6: UDP flood                                               */
-/* ------------------------------------------------------------------ */
 
 typedef struct {
     ip_addr_t victim, attacker;
@@ -604,75 +503,12 @@ static int detect_udpflood(const stats_t *s, const thresholds_t *t, anomalies_t 
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Detektor 7: skoki natężenia ruchu                                   */
-/* ------------------------------------------------------------------ */
-
-static int detect_spikes(const stats_t *s, const thresholds_t *t, anomalies_t *out)
-{
-    if (s->tl_len < 10)
-        return 0;     /* za krótkie nagranie, by mówić o statystyce */
-
-    /* Średnia i odchylenie standardowe liczby pakietów na sekundę. */
-    double sum = 0, sum2 = 0;
-    for (size_t i = 0; i < s->tl_len; i++) {
-        double v = s->timeline[i].pkts[0] + s->timeline[i].pkts[1];
-        sum += v;
-        sum2 += v * v;
-    }
-    double mean = sum / s->tl_len;
-    double var = sum2 / s->tl_len - mean * mean;
-    double sd = var > 0 ? sqrt(var) : 0;
-    double limit = mean + t->spike_sigma * sd;
-
-    size_t count = 0, max_i = 0, first_i = 0, last_i = 0;
-    double max_v = 0;
-    for (size_t i = 0; i < s->tl_len; i++) {
-        double v = s->timeline[i].pkts[0] + s->timeline[i].pkts[1];
-        if (v > limit && v >= 2 * mean && v >= 100) {
-            if (count == 0) first_i = i;
-            last_i = i;
-            count++;
-            if (v > max_v) { max_v = v; max_i = i; }
-        }
-    }
-    out->spike_count = count;
-    if (count > 0) {
-        anomaly_t *an = add_anomaly(out, SEV_WARN, "Skok natężenia ruchu", ADV_SPIKE,
-                "Liczba sekund z ruchem powyżej %.0f pakietów/s (średnia %.1f + %.0f "
-                "odchyleń standardowych): %zu. Największy skok: %.0f pakietów w %zu. "
-                "sekundzie nagrania.", limit, mean, t->spike_sigma, count, max_v, max_i);
-        if (an == NULL)
-            return -1;
-        snprintf(an->source, sizeof an->source, "-");
-        snprintf(an->target, sizeof an->target, "-");
-        an->t_start = s->first_ts + (double)first_i;
-        an->t_end = s->first_ts + (double)last_i + 1.0;
-    }
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-
 static int cmp_anomaly_sev(const void *x, const void *y)
 {
     const anomaly_t *p = x, *q = y;
     if (p->severity != q->severity)
         return (int)q->severity - (int)p->severity;   /* najpierw najpoważniejsze */
     return (p->t_start > q->t_start) - (p->t_start < q->t_start);  /* potem wg czasu */
-}
-
-/*
- * Wynik ryzyka 0-100: każdy incydent krytyczny dodaje 35 punktów,
- * ostrzeżenie 15, informacja 0. Wynik jest obcinany do 100.
- */
-static int compute_risk(const anomalies_t *a)
-{
-    int score = 0;
-    for (size_t i = 0; i < a->n; i++)
-        score += a->items[i].severity == SEV_CRIT ? 35 :
-                 a->items[i].severity == SEV_WARN ? 15 : 0;
-    return score > 100 ? 100 : score;
 }
 
 int anomalies_detect(const stats_t *s, const thresholds_t *t, anomalies_t *out)
@@ -682,60 +518,12 @@ int anomalies_detect(const stats_t *s, const thresholds_t *t, anomalies_t *out)
     if (detect_synflood(s, t, out) != 0)   return -1;
     if (detect_tcp_health(s, t, out) != 0) return -1;
     if (detect_udpflood(s, t, out) != 0)   return -1;
-    if (detect_spikes(s, t, out) != 0)     return -1;
     if (out->n > 1)
         qsort(out->items, out->n, sizeof *out->items, cmp_anomaly_sev);
-    out->risk_score = compute_risk(out);
     return 0;
 }
 
 /* Szuka adresu na liście; jeśli go nie ma - dopisuje. Zwraca wskaźnik na wpis. */
-static ioc_t *ioc_find(ioc_t *list, long *n, const ip_addr_t *ip)
-{
-    for (long i = 0; i < *n; i++)
-        if (addr_cmp(&list[i].ip, ip) == 0)
-            return &list[i];
-    ioc_t *e = &list[(*n)++];
-    memset(e, 0, sizeof *e);
-    e->ip = *ip;
-    return e;
-}
-
-static int cmp_ioc(const void *x, const void *y)
-{
-    const ioc_t *p = x, *q = y;
-    if (p->max_sev != q->max_sev)       return (int)q->max_sev - (int)p->max_sev;
-    if ((p->attacker > 0) != (q->attacker > 0)) return (q->attacker > 0) - (p->attacker > 0);
-    return addr_cmp(&p->ip, &q->ip);
-}
-
-long anomalies_ioc(const anomalies_t *a, ioc_t **out)
-{
-    /* Każdy incydent daje najwyżej 2 adresy, więc 2*n miejsc wystarczy. */
-    ioc_t *list = malloc((2 * a->n + 1) * sizeof *list);
-    if (list == NULL)
-        return -1;
-    long n = 0;
-    for (size_t i = 0; i < a->n; i++) {
-        const anomaly_t *an = &a->items[i];
-        if (an->severity == SEV_INFO)
-            continue;
-        if (an->has_src_ip) {
-            ioc_t *e = ioc_find(list, &n, &an->src_ip);
-            e->attacker++;
-            if (an->severity > e->max_sev) e->max_sev = an->severity;
-        }
-        if (an->has_dst_ip) {
-            ioc_t *e = ioc_find(list, &n, &an->dst_ip);
-            e->victim++;
-            if (an->severity > e->max_sev) e->max_sev = an->severity;
-        }
-    }
-    qsort(list, (size_t)n, sizeof *list, cmp_ioc);
-    *out = list;
-    return n;
-}
-
 void anomalies_free(anomalies_t *a)
 {
     free(a->items);

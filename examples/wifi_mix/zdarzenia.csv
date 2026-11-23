@@ -1,0 +1,8 @@
+typ;start_s;koniec_s;czas_s;szczyt;opis
+"Podejrzenie ruchu";14;31;17;4.56;"wahania RSSI do 4.6 dB"
+"Zakłócenia radiowe";45;60;15;48.68;"powtórzone ramki do 49%"
+"Wzrost opóźnienia";75;86;11;191.50;"RTT do 192 ms"
+"Retransmisje TCP";77;84;7;39.00;"do 39 retransmisji/s"
+"Podejrzenie ruchu";99;119;20;4.38;"wahania RSSI do 4.4 dB"
+"Przerwa w ruchu";128;133;5;5.00;"brak pakietów TCP/UDP przez 5 s"
+"Podejrzenie ruchu";149;161;12;4.12;"wahania RSSI do 4.1 dB"
